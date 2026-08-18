@@ -1,0 +1,40 @@
+<?xml version="1.0"?>
+<?xml-stylesheet type="text/xsl" href="configuration.xsl"?>
+<configuration>
+  <!--
+    Hive Metastore configuration.
+    Mounted into the apache/hive image via HIVE_CUSTOM_CONF_DIR and used for
+    both the first-boot schema initialization (schematool) and the metastore
+    service itself.
+
+    NOTE: values are Docker-internal wiring (service name + local dev
+    credentials), matching the defaults in ../.env.example.
+  -->
+
+  <!-- Postgres backend for the Hive Metastore -->
+  <property>
+    <name>javax.jdo.option.ConnectionURL</name>
+    <value>jdbc:postgresql://postgres:5432/hive</value>
+  </property>
+
+  <property>
+    <name>javax.jdo.option.ConnectionUserName</name>
+    <value>hive</value>
+  </property>
+
+  <property>
+    <name>javax.jdo.option.ConnectionPassword</name>
+    <value>hive</value>
+  </property>
+
+  <property>
+    <name>javax.jdo.option.ConnectionDriverName</name>
+    <value>org.postgresql.Driver</value>
+  </property>
+
+  <!-- Create the metastore schema tables automatically on first start -->
+  <property>
+    <name>datanucleus.schema.autoCreateAll</name>
+    <value>true</value>
+  </property>
+</configuration>
