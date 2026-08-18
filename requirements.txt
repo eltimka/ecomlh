@@ -1,0 +1,35 @@
+# =============================================================================
+# E-Commerce Customer 360 Lakehouse - Python dependencies
+# Python 3.11+
+# =============================================================================
+
+# --- Orchestration (Dagster) ---
+dagster>=1.9,<2
+dagster-webserver>=1.9,<2
+
+# --- Data processing ---
+polars>=1.5
+pyarrow>=17.0
+
+# --- Iceberg (client-side writes; s3 extra pulls s3fs/fsspec) ---
+pyiceberg[pyarrow,s3]>=0.8
+thrift>=0.16            # required for pyiceberg Hive catalog client
+
+# --- Trino client (SQL from Dagster assets, scripts, dashboard) ---
+trino>=450
+
+# --- S3 / MinIO ---
+boto3>=1.34
+minio>=7.2
+
+# --- Utilities ---
+python-dotenv>=1.0
+requests>=2.31
+
+# --- Dashboard (Streamlit) ---
+streamlit>=1.36
+altair>=5.3
+
+# --- dbt (transformations & data quality) ---
+dbt-core>=1.8
+dbt-trino>=1.8

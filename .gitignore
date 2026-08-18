@@ -1,0 +1,37 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# --- Environments / secrets (never commit) ---
+.env
+.env.*
+!.env.example
+
+# --- Dagster ---
+.dagster/
+dagster_home/
+instance/
+
+# --- dbt ---
+dbt/target/
+dbt/logs/
+dbt/dbt_packages/
+
+# --- Data artifacts (generated, not source) ---
+*.parquet
+*.arrow
+data/
+*.db
+*.sqlite3
+
+# --- OS / IDE ---
+.DS_Store
+.idea/
+.vscode/
