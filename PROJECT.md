@@ -235,21 +235,20 @@ Build the core analytical models:
 
 ---
 
-**Current status:** Phases 0-1 complete (scaffold + Docker Compose infrastructure).
+**Current status:** Phases 0-3 complete (scaffold, Docker Compose infrastructure,
+bootstrap lakehouse, Dagster project setup).
 
-Phase 2 (Bootstrap Lakehouse) is implemented in:
-- `scripts/bootstrap_minio.py` - creates the bronze/silver/gold MinIO buckets
-- `scripts/create_schemas.sql` - creates the Trino medallion schemas
-- `scripts/verify_lakehouse.py` - end-to-end check (buckets, schemas, test Iceberg table lifecycle)
+Phase 3 notes (Dagster 1.13.18 on Python 3.14):
+- `@asset` uses `key_prefix=("bronze",)` - the old `group_key` param was removed.
+- Resources: `ecommerce_lakehouse.resources` (TrinoResource, MinioResource),
+  defaults from repo-root .env.
+- Entry point: `ecommerce_lakehouse.definitions` (Definitions object),
+  loaded via `dagster_project/workspace.yaml`.
+- Package installed editable: `pip install -e dagster_project`.
+- Verified: `dagster dev` serves the UI on :3000; all three placeholder assets
+  (bronze.bronze_placeholder, silver.silver_placeholder, gold.gold_placeholder)
+  materialize successfully; Trino/Minio resources work against the live stack.
+- Known 1.13 CLI quirk: `dagster asset materialize --select` does not resolve
+  dotted asset keys; materialize from the UI (or the Python `materialize()` API).
 
-Key infra notes (discovered during Phase 2, 2026-08):
-- Trino does NOT do `${ENV_VAR}` substitution in catalog files - MinIO credentials
-  are hardcoded in `docker/trino/catalog/iceberg.properties` (local dev only).
-- The Hive Metastore (Hive 4) validates s3a:// table locations via Hadoop,
-  which requires hadoop-aws on the HMS classpath: staged by the `hive-aws-init`
-  one-shot into the shared `hive-auxjars` volume (exposed via HIVE_AUX_JARS_PATH),
-  plus `docker/hive/conf/core-site.xml` with fs.s3a.* pointing at MinIO.
-
-Next: Phase 3 (Dagster project setup). Verify Phase 2 with:
-    python scripts/bootstrap_minio.py
-    python scripts/verify_lakehouse.py
+Next: Phase 4 (synthetic data generator).

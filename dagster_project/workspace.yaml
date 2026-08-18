@@ -1,0 +1,5 @@
+# Dagster workspace for the e-commerce Customer 360 lakehouse.
+# `dagster dev` (run from this directory) picks this up automatically.
+
+load_from:
+  - python_module: ecommerce_lakehouse.definitions

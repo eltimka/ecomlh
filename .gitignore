@@ -18,6 +18,7 @@ env/
 .dagster/
 dagster_home/
 instance/
+.tmp_dagster_home_*/
 
 # --- dbt ---
 dbt/target/

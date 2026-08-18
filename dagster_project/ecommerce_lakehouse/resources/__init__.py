@@ -1,1 +1,6 @@
-"""Dagster resources: Trino, MinIO/S3, Hive Metastore, Iceberg catalog."""
+"""Dagster resources for the e-commerce lakehouse (Trino, MinIO)."""
+
+from .minio import MinioResource
+from .trino import TrinoResource
+
+__all__ = ["MinioResource", "TrinoResource"]

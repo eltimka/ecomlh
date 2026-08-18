@@ -1,0 +1,18 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ecommerce-lakehouse"
+version = "0.1.0"
+description = "Dagster assets for the E-Commerce Customer 360 local lakehouse"
+requires-python = ">=3.11"
+dependencies = [
+    "dagster>=1.9,<2",
+    "trino>=0.338",
+    "boto3>=1.34",
+    "python-dotenv>=1.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["ecommerce_lakehouse"]
