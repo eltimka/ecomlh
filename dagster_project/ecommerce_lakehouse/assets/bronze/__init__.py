@@ -145,3 +145,6 @@ def _bronze_asset(table: str):
 
 
 bronze_assets = [_bronze_asset(table) for table in BRONZE_TABLES]
+
+#: table name -> asset definition, for wiring downstream `deps=[...]` (lineage)
+BRONZE_ASSETS_BY_NAME = {a.key.path[-1]: a for a in bronze_assets}

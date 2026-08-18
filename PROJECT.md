@@ -235,9 +235,34 @@ Build the core analytical models:
 
 ---
 
-**Current status:** Phases 0-5 complete (scaffold, Docker Compose infrastructure,
+**Current status:** Phases 0-6 complete (scaffold, Docker Compose infrastructure,
 bootstrap lakehouse, Dagster project setup, synthetic data generator,
-bronze layer ingestion).
+bronze layer ingestion, silver layer transformations).
+
+Phase 6 notes (silver layer):
+- 9 assets: 3 dimensions (dim_customers, dim_products, dim_order_dates) +
+  6 facts (fct_orders, fct_order_items, fct_payments, fct_refunds,
+  fct_web_events, fct_support_tickets) in iceberg.silver, all explicit
+  s3a://silver/<name> locations (same rule as bronze).
+- Declarative spec-driven design: assets/silver/sql.py holds one spec per
+  table (CTAS SQL + pre/post stat queries); the factory in
+  assets/silver/__init__.py builds the assets, resolves bronze +
+  intra-silver deps (fct_order_items depends on silver.dim_products) for
+  UI lineage, and reports every drop/fix as run metadata (bronze_rows,
+  duplicate_emails, orphan_orders, rows_silver, payment_conflicts, ...).
+- Transformations: enum standardization (lower+trim), dedup on email
+  (dim_customers) and one-payment-per-order (fct_payments), referential
+  integrity enforcement (inner joins to dimensions; orphans dropped and
+  counted), DECIMAL(12,2) money, derived flags/metrics (status booleans,
+  refund_lag_days, is_full_refund, holiday-season calendar dim,
+  payment-status conflict flag, ticket link validation).
+- Trino 483 gotchas: no title() function, no bare SELECT UNNEST(...) -
+  use FROM UNNEST(SEQUENCE(...)) AS t(d); no day_of_week_name - use
+  ELEMENT_AT over an array indexed by day_of_week(); iceberg CTAS without
+  location falls back to an unusable file:// HMS warehouse path.
+- Verify: python scripts/verify_silver.py (24 checks, RESULT: PASS).
+
+Next: Phase 7 (Gold layer - Customer 360 wide table, LTV, RFM, churn).
 
 Phase 5 notes (bronze layer):
 - Trino 4xx's hive connector does NOT use Hadoop: it has a native S3
@@ -261,4 +286,5 @@ Phase 5 notes (bronze layer):
   `resources={...}`; `dg.Failure(msg)` takes a positional message.
 - Verify: python scripts/verify_bronze.py (12 checks, RESULT: PASS).
 
-Next: Phase 6 (Silver layer - cleaning, conformance, dedup).
+Next: Phase 6 (Silver layer - cleaning, conformance, dedup) - done, see
+Phase 6 notes above.
