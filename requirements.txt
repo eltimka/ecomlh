@@ -16,7 +16,7 @@ pyiceberg[pyarrow,s3]>=0.8
 thrift>=0.16            # required for pyiceberg Hive catalog client
 
 # --- Trino client (SQL from Dagster assets, scripts, dashboard) ---
-trino>=450
+trino>=0.338  # newer client releases (45x) cap out below Python 3.14
 
 # --- S3 / MinIO ---
 boto3>=1.34

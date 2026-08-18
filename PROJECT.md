@@ -235,6 +235,21 @@ Build the core analytical models:
 
 ---
 
-**Current status:** Ready to begin Phase 0.
+**Current status:** Phases 0-1 complete (scaffold + Docker Compose infrastructure).
 
-Start by creating the project scaffold and then the Docker Compose infrastructure (Phase 1).
+Phase 2 (Bootstrap Lakehouse) is implemented in:
+- `scripts/bootstrap_minio.py` - creates the bronze/silver/gold MinIO buckets
+- `scripts/create_schemas.sql` - creates the Trino medallion schemas
+- `scripts/verify_lakehouse.py` - end-to-end check (buckets, schemas, test Iceberg table lifecycle)
+
+Key infra notes (discovered during Phase 2, 2026-08):
+- Trino does NOT do `${ENV_VAR}` substitution in catalog files - MinIO credentials
+  are hardcoded in `docker/trino/catalog/iceberg.properties` (local dev only).
+- The Hive Metastore (Hive 4) validates s3a:// table locations via Hadoop,
+  which requires hadoop-aws on the HMS classpath: staged by the `hive-aws-init`
+  one-shot into the shared `hive-auxjars` volume (exposed via HIVE_AUX_JARS_PATH),
+  plus `docker/hive/conf/core-site.xml` with fs.s3a.* pointing at MinIO.
+
+Next: Phase 3 (Dagster project setup). Verify Phase 2 with:
+    python scripts/bootstrap_minio.py
+    python scripts/verify_lakehouse.py

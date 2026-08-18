@@ -1,0 +1,46 @@
+<?xml version="1.0"?>
+<?xml-stylesheet type="text/xsl" href="configuration.xsl"?>
+<configuration>
+  <!--
+    Hadoop FileSystem configuration for the Hive Metastore process.
+
+    WHY THIS FILE EXISTS:
+    Hive 4's metastore validates table locations at CREATE TABLE time
+    (HMSHandler.create_table_core -> Warehouse.isDir -> Path.getFileSystem).
+    For s3a:// locations it instantiates org.apache.hadoop.fs.s3a.S3AFileSystem,
+    which requires:
+      1. hadoop-aws + aws-java-sdk-bundle on the HMS classpath
+         (staged by the hive-aws-init one-shot service into /opt/hive/auxjars,
+         added via HIVE_AUX_JARS_PATH in docker-compose.yml)
+      2. The fs.s3a.* properties below, pointing at MinIO.
+    Without both, Iceberg table creation fails with:
+      "ClassNotFoundException: Class org.apache.hadoop.fs.s3a.S3AFileSystem not found"
+
+    Local-dev credentials only - same as the MinIO service in ../docker-compose.yml.
+  -->
+
+  <property>
+    <name>fs.s3a.impl</name>
+    <value>org.apache.hadoop.fs.s3a.S3AFileSystem</value>
+  </property>
+  <property>
+    <name>fs.s3a.endpoint</name>
+    <value>http://minio:9000</value>
+  </property>
+  <property>
+    <name>fs.s3a.access.key</name>
+    <value>minioadmin</value>
+  </property>
+  <property>
+    <name>fs.s3a.secret.key</name>
+    <value>minioadmin</value>
+  </property>
+  <property>
+    <name>fs.s3a.path.style.access</name>
+    <value>true</value>
+  </property>
+  <property>
+    <name>fs.s3a.connection.maximum</name>
+    <value>20</value>
+  </property>
+</configuration>

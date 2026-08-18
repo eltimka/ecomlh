@@ -70,15 +70,21 @@ ecommerce-customer-360-lakehouse/
 ## Quick Start (once built)
 
 ```bash
+# 0. Python environment (once)
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+
 # 1. Start the lakehouse infrastructure
 cd docker
 docker compose up -d
 
 # 2. Bootstrap MinIO buckets and Trino schemas
-python ../scripts/bootstrap_minio.py
+cd ..
+.venv/bin/python scripts/bootstrap_minio.py
+.venv/bin/python scripts/verify_lakehouse.py
 
 # 3. Start Dagster
-cd ../dagster_project
+cd dagster_project
 dagster dev
 
 # 4. Materialize assets from the Dagster UI (http://localhost:3000)

@@ -13,7 +13,7 @@
 # To override, put values in the repo-root .env file (see .env.example).
 #
 # Startup order:
-#   postgres -> hive-jdbc-init -> hive (metastore) -> trino
+#   postgres -> hive-jdbc-init -> hive-aws-init -> hive (metastore) -> trino
 #   minio starts independently (ready in ~2s).
 # First start takes a few minutes: the Hive Metastore initializes its
 # Postgres schema on first boot.
@@ -69,8 +69,9 @@ services:
 
   # ---------------------------------------------------------------------------
   # One-shot init: download the Postgres JDBC driver (needed by Hive) into a
-  # shared volume. Skips the download if the jar is already there (volume
-  # persists across restarts; removed only by `docker compose down -v`).
+  # shared aux-jars volume. Skips the download if the jar is already there
+  # (volume persists across restarts; removed only by `docker compose down -v`).
+  # hive-aws-init (below) stages the Hadoop AWS jars into the same volume.
   # ---------------------------------------------------------------------------
   hive-jdbc-init:
     image: curlimages/curl:8.12.1
@@ -81,14 +82,43 @@ services:
     command:
       - |
         set -e
-        if [ ! -f /jdbc/postgresql.jar ]; then
-          echo "Downloading Postgres JDBC driver -> /jdbc/postgresql.jar"
-          curl -fsSL -o /jdbc/postgresql.jar \
+        if [ ! -f /auxjars/postgresql.jar ]; then
+          echo "Downloading Postgres JDBC driver -> /auxjars/postgresql.jar"
+          curl -fsSL -o /auxjars/postgresql.jar \
             "${POSTGRES_JDBC_URL:-https://repo1.maven.org/maven2/org/postgresql/postgresql/42.7.7/postgresql-42.7.7.jar}"
         fi
-        echo "Postgres JDBC driver ready at /jdbc/postgresql.jar"
+        echo "Postgres JDBC driver ready at /auxjars/postgresql.jar"
     volumes:
-      - hive-jdbc:/jdbc
+      - hive-auxjars:/auxjars
+    restart: "no"
+
+  # ---------------------------------------------------------------------------
+  # One-shot init: stage hadoop-aws + aws-java-sdk-bundle (present in the
+  # apache/hive image but NOT on the metastore classpath) into a shared
+  # volume. The hive service exposes it via HIVE_AUX_JARS_PATH. Without
+  # hadoop-aws the HMS cannot validate s3a:// table locations (S3AFileSystem
+  # ClassNotFound) and Iceberg table creation fails.
+  # ---------------------------------------------------------------------------
+  hive-aws-init:
+    image: apache/hive:4.0.1
+    container_name: hive-aws-init
+    # image default user (hive) cannot write the root-owned volume
+    user: "0:0"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        SRC=/opt/hadoop/share/hadoop/tools/lib
+        if [ ! -f /auxjars/hadoop-aws.jar ] || [ ! -f /auxjars/aws-java-sdk-bundle.jar ]; then
+          echo "Staging Hadoop AWS jars -> /auxjars"
+          cp $${SRC}/hadoop-aws-*.jar /auxjars/hadoop-aws.jar
+          cp $${SRC}/aws-java-sdk-bundle-*.jar /auxjars/aws-java-sdk-bundle.jar
+        fi
+        echo "Hadoop AWS jars ready at /auxjars"
+    volumes:
+      - hive-auxjars:/auxjars
+    depends_on:
+      - hive-jdbc-init
     restart: "no"
 
   # ---------------------------------------------------------------------------
@@ -104,14 +134,15 @@ services:
       SERVICE_NAME: metastore
       DB_DRIVER: postgres
       HIVE_CUSTOM_CONF_DIR: /opt/hive/custom-conf
-      HIVE_AUX_JARS_PATH: /opt/hive/jdbc
+      HIVE_AUX_JARS_PATH: /opt/hive/auxjars
     ports:
       - "9083:9083"
     volumes:
       - ./hive/conf/hive-site.xml:/opt/hive/custom-conf/hive-site.xml:ro
-      - hive-jdbc:/opt/hive/jdbc
+      - ./hive/conf/core-site.xml:/opt/hive/custom-conf/core-site.xml:ro
+      - hive-auxjars:/opt/hive/auxjars:ro
     depends_on:
-      hive-jdbc-init:
+      hive-aws-init:
         condition: service_completed_successfully
       postgres:
         condition: service_healthy
@@ -129,15 +160,11 @@ services:
   trino:
     image: trinodb/trino:483
     container_name: trino
-    environment:
-      # Consumed by /etc/trino/catalog/iceberg.properties via ${VAR}
-      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minioadmin}
-      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-minioadmin}
-      MINIO_REGION: ${MINIO_REGION:-us-east-1}
     ports:
       - "8080:8080"
     volumes:
       - ./trino/config.properties:/etc/trino/config.properties:ro
+      - ./trino/log.properties:/etc/trino/log.properties:ro
       - ./trino/jvm.config:/etc/trino/jvm.config:ro
       - ./trino/catalog/iceberg.properties:/etc/trino/catalog/iceberg.properties:ro
     depends_on:
@@ -156,4 +183,4 @@ services:
 volumes:
   minio-data:
   postgres-data:
-  hive-jdbc:
+  hive-auxjars:
