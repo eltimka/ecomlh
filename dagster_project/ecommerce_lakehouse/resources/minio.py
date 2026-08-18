@@ -8,14 +8,14 @@ from typing import Any
 
 import boto3
 from botocore.config import Config as BotoConfig
-from dagster import Config as DagsterConfig
+from dagster import ConfigurableResource
 from dotenv import load_dotenv
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 load_dotenv(REPO_ROOT / ".env")
 
 
-class MinioResource(DagsterConfig):
+class MinioResource(ConfigurableResource):
     """Dagster resource for the local MinIO S3 API.
 
     Used for bucket management and object-level checks. Iceberg table
@@ -63,3 +63,14 @@ class MinioResource(DagsterConfig):
         for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
             keys.extend(obj["Key"] for obj in page.get("Contents", []))
         return keys
+
+    def upload_file(self, local_path: str | Path, key: str, bucket: str | None = None) -> str:
+        """Upload a local file to the bronze bucket (default) at ``key``.
+
+        Returns the s3a:// URI of the uploaded object. Overwrites any
+        existing object with the same key (bronze raw files are keyed by
+        table name; regeneration is deterministic, see Phase 4).
+        """
+        target = bucket or self.bucket_bronze
+        self.s3_client().upload_file(str(local_path), target, key)
+        return f"s3a://{target}/{key}"

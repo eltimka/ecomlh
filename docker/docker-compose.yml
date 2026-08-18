@@ -155,7 +155,9 @@ services:
     restart: unless-stopped
 
   # ---------------------------------------------------------------------------
-  # Trino - SQL query engine over Iceberg (single node, local dev)
+  # Trino - SQL query engine over Iceberg + raw bronze (single node, local dev).
+  # The hive catalog (trino/catalog/hive.properties) uses Trino's native S3
+  # filesystem (fs.s3.enabled) to read raw Parquet from MinIO - no Hadoop.
   # ---------------------------------------------------------------------------
   trino:
     image: trinodb/trino:483
@@ -167,6 +169,7 @@ services:
       - ./trino/log.properties:/etc/trino/log.properties:ro
       - ./trino/jvm.config:/etc/trino/jvm.config:ro
       - ./trino/catalog/iceberg.properties:/etc/trino/catalog/iceberg.properties:ro
+      - ./trino/catalog/hive.properties:/etc/trino/catalog/hive.properties:ro
     depends_on:
       minio:
         condition: service_healthy

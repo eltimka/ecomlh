@@ -7,14 +7,14 @@ from pathlib import Path
 from typing import Any
 
 import trino.dbapi
-from dagster import Config
+from dagster import ConfigurableResource
 from dotenv import load_dotenv
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 load_dotenv(REPO_ROOT / ".env")
 
 
-class TrinoResource(Config):
+class TrinoResource(ConfigurableResource):
     """Dagster resource for running SQL against the local Trino coordinator.
 
     Defaults come from the repo-root .env (TRINO_HOST / TRINO_PORT /

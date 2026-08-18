@@ -235,18 +235,30 @@ Build the core analytical models:
 
 ---
 
-**Current status:** Phases 0-4 complete (scaffold, Docker Compose infrastructure,
-bootstrap lakehouse, Dagster project setup, synthetic data generator).
+**Current status:** Phases 0-5 complete (scaffold, Docker Compose infrastructure,
+bootstrap lakehouse, Dagster project setup, synthetic data generator,
+bronze layer ingestion).
 
-Phase 4 notes (synthetic data generator):
-- `data_generator/generate_synthetic.py` - numpy PCG64 master seed -> one child
-  RNG per entity (order-independent determinism); polars writes Parquet to
-  `data/synthetic/` + `manifest.json` (rows, dtypes, per-table sha256).
-- Defaults from .env (DATA_SEED, DATA_DATE_*, DATA_NUM_CUSTOMERS/ORDERS);
-  CLI overrides for all knobs.
-- Verified: same seed => identical content hashes; referential integrity,
-  business rules (cancelled => failed payment, refunds only on returned,
-  totals consistent) all pass. Runtime ~3s for the default 256k rows.
-- Phase 5 bronze assets read these parquet files directly.
+Phase 5 notes (bronze layer):
+- Trino 4xx's hive connector does NOT use Hadoop: it has a native S3
+  filesystem (trino-filesystem-s3, AWS SDK v2). Enable with catalog props
+  `fs.s3.enabled=true` + `s3.endpoint`/`s3.aws-access-key`/... in
+  docker/trino/catalog/hive.properties. Stock `trinodb/trino:483` image
+  works - no custom image or hadoop-aws jars needed (an earlier custom
+  image attempt was reverted after this was discovered).
+- Flow per asset: upload data/synthetic/<t>.parquet -> s3a://bronze/raw/<t>/
+  (immutable landing zone, directly queryable as hive.bronze_raw.<t>),
+  then DROP + CTAS into iceberg.bronze.<t> (full refresh, idempotent).
+  DDL column types inferred from the parquet schema via polars.
+- 8 bronze assets (bronze.customers ... bronze.support_tickets) replace the
+  Phase 3 placeholder; row counts match the Phase 4 manifest exactly.
+- Dagster 1.13 gotchas hit and fixed: resources must be declared as typed
+  function params (Config-based classes are NOT recognized as resource
+  annotations - switched resources to ConfigurableResource, a Config subclass
+  that is); `context.resource("x")` is gone (scoped `context.resources`);
+  `AssetKey.to_string()` now returns JSON-like output and `has_prefix`
+  requires a sequence; `materialize()` on bare asset defs needs explicit
+  `resources={...}`; `dg.Failure(msg)` takes a positional message.
+- Verify: python scripts/verify_bronze.py (12 checks, RESULT: PASS).
 
-Next: Phase 5 (Bronze layer ingestion into Iceberg).
+Next: Phase 6 (Silver layer - cleaning, conformance, dedup).
