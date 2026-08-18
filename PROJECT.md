@@ -235,20 +235,18 @@ Build the core analytical models:
 
 ---
 
-**Current status:** Phases 0-3 complete (scaffold, Docker Compose infrastructure,
-bootstrap lakehouse, Dagster project setup).
+**Current status:** Phases 0-4 complete (scaffold, Docker Compose infrastructure,
+bootstrap lakehouse, Dagster project setup, synthetic data generator).
 
-Phase 3 notes (Dagster 1.13.18 on Python 3.14):
-- `@asset` uses `key_prefix=("bronze",)` - the old `group_key` param was removed.
-- Resources: `ecommerce_lakehouse.resources` (TrinoResource, MinioResource),
-  defaults from repo-root .env.
-- Entry point: `ecommerce_lakehouse.definitions` (Definitions object),
-  loaded via `dagster_project/workspace.yaml`.
-- Package installed editable: `pip install -e dagster_project`.
-- Verified: `dagster dev` serves the UI on :3000; all three placeholder assets
-  (bronze.bronze_placeholder, silver.silver_placeholder, gold.gold_placeholder)
-  materialize successfully; Trino/Minio resources work against the live stack.
-- Known 1.13 CLI quirk: `dagster asset materialize --select` does not resolve
-  dotted asset keys; materialize from the UI (or the Python `materialize()` API).
+Phase 4 notes (synthetic data generator):
+- `data_generator/generate_synthetic.py` - numpy PCG64 master seed -> one child
+  RNG per entity (order-independent determinism); polars writes Parquet to
+  `data/synthetic/` + `manifest.json` (rows, dtypes, per-table sha256).
+- Defaults from .env (DATA_SEED, DATA_DATE_*, DATA_NUM_CUSTOMERS/ORDERS);
+  CLI overrides for all knobs.
+- Verified: same seed => identical content hashes; referential integrity,
+  business rules (cancelled => failed payment, refunds only on returned,
+  totals consistent) all pass. Runtime ~3s for the default 256k rows.
+- Phase 5 bronze assets read these parquet files directly.
 
-Next: Phase 4 (synthetic data generator).
+Next: Phase 5 (Bronze layer ingestion into Iceberg).

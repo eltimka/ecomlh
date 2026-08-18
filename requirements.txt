@@ -10,6 +10,7 @@ dagster-webserver>=1.9,<2
 # --- Data processing ---
 polars>=1.5
 pyarrow>=17.0
+numpy>=1.26            # deterministic RNG for the synthetic data generator
 
 # --- Iceberg (client-side writes; s3 extra pulls s3fs/fsspec) ---
 pyiceberg[pyarrow,s3]>=0.8
