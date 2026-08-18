@@ -235,9 +235,34 @@ Build the core analytical models:
 
 ---
 
-**Current status:** Phases 0-6 complete (scaffold, Docker Compose infrastructure,
+**Current status:** Phases 0-7 complete (scaffold, Docker Compose infrastructure,
 bootstrap lakehouse, Dagster project setup, synthetic data generator,
-bronze layer ingestion, silver layer transformations).
+bronze layer ingestion, silver layer transformations, gold Customer 360 marts).
+
+Phase 7 notes (gold layer - Customer 360):
+- 4 assets in iceberg.gold, all reading silver:
+  * customer_360 - one row per customer: demographics + LTV metrics
+    (gross/net revenue, refunds, AOV, items), RFM quintile scores + segment
+    (champion/loyal/new_or_returning/potential_loyalist/needs_attention/
+    hibernating/lost/no_orders), churn risk (recency vs the customer's own
+    avg inter-order gap, fallback global avg: <1.5 low, <2.5 medium, else
+    high), support tickets + web engagement (cart adds, last event).
+  * revenue_by_channel - month x channel (orders, gross/net, AOV, rates)
+  * revenue_by_category - month x category (units, gross, revenue share)
+  * monthly_kpis - monthly order-summary KPIs (status mix, new vs returning
+    customers, return/cancel rates)
+- Modeling conventions (documented in assets/gold/sql.py): as-of date =
+  max(order_date) in the data (deterministic, no wall-clock); revenue =
+  non-cancelled orders; realized LTV = net revenue.
+- Refactor: the silver/gold spec-driven factory was extracted to
+  assets/factory.py (build_layer_assets: CTAS + pre/post stat metadata +
+  explicit s3a locations + dep resolution for lineage); silver re-tested
+  green after the refactor.
+- Verify: python scripts/verify_gold.py (17 checks, RESULT: PASS), incl.
+  a 5-view gross-revenue invariant (fct_orders = customer_360 = by_channel
+  = by_category = monthly_kpis, exact to the cent).
+
+Next: Phase 8 (data quality & observability - Dagster asset checks).
 
 Phase 6 notes (silver layer):
 - 9 assets: 3 dimensions (dim_customers, dim_products, dim_order_dates) +

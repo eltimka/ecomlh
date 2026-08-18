@@ -2,7 +2,7 @@
 
 Each spec drives one silver asset (see __init__.py factory):
 
-- ``deps`` / ``silver_deps``: upstream asset names (bronze / silver) for
+- ``deps`` / ``local_deps``: upstream asset names (bronze / silver) for
   Dagster lineage.
 - ``ctas``: full-refresh ``CREATE TABLE iceberg.silver.<name> AS ...``
 - ``pre_stats`` / ``post_stats``: (label, scalar SQL) pairs reported as
@@ -210,7 +210,7 @@ SILVER_SPECS: list[dict] = [
         "name": "fct_order_items",
         "table": "iceberg.silver.fct_order_items",
         "deps": ["order_items", "orders"],
-        "silver_deps": ["dim_products"],
+        "local_deps": ["dim_products"],
         "description": (
             "Order-item fact: validated against orders and dim_products "
             "(orphans dropped), DECIMAL money, denormalized product "

@@ -1,22 +1,22 @@
 """Gold layer (Customer 360 marts) - asset group.
 
-Phase 3: placeholder asset only. Real Customer 360 models
-(customer_360, LTV, RFM, churn risk, revenue marts) land here in Phase 7.
+Phase 7: 4 Customer 360 models in ``iceberg.gold``:
+
+- ``customer_360``      - one row per customer: demographics + LTV
+  metrics + RFM scores/segment + churn risk + support/web engagement
+- ``revenue_by_channel`` - month x channel revenue mart
+- ``revenue_by_category`` - month x category revenue mart
+- ``monthly_kpis``       - monthly order-summary KPIs
+
+Per-table specs (CTAS SQL + stats) live in :mod:`.sql`; modeling
+conventions (as-of date, LTV definition, RFM quintiles, churn heuristic)
+are documented there. Assets are built by the shared spec-driven factory.
 """
 
-import dagster as dg
+from ..factory import build_layer_assets
+from ..silver import SILVER_ASSETS_BY_NAME
+from .sql import GOLD_SPECS
 
-
-@dg.asset(
-    key_prefix=("gold",),
-    description=(
-        "Placeholder for the gold layer. Will be replaced by real "
-        "Customer 360 assets in Phase 7."
-    ),
+gold_assets, GOLD_ASSETS_BY_NAME = build_layer_assets(
+    "gold", GOLD_SPECS, SILVER_ASSETS_BY_NAME
 )
-def gold_placeholder() -> None:
-    """Placeholder asset marking the gold asset group (Phase 3)."""
-    # No-op: nothing to materialize yet.
-
-
-gold_assets = [gold_placeholder]
