@@ -249,10 +249,11 @@ Build the core analytical models:
 
 ---
 
-**Current status:** Phases 0-9 complete (scaffold, Docker Compose infrastructure,
-bootstrap lakehouse, Dagster project setup, synthetic data generator,
-bronze layer ingestion, silver layer transformations, gold Customer 360 marts,
-data quality & observability, Apache Superset dashboard).
+**Current status:** Phases 0-10 complete - project done (scaffold, Docker Compose
+infrastructure, bootstrap lakehouse, Dagster project setup, synthetic data
+generator, bronze layer ingestion, silver layer transformations, gold
+Customer 360 marts, data quality & observability, Apache Superset dashboard,
+polish & one-command startup).
 
 Phase 9 notes (Apache Superset dashboard):
 - apache/superset:4.1.1 service in the compose stack (UI port 8088; the
@@ -293,6 +294,37 @@ Phase 9 notes (Apache Superset dashboard):
   full re-bootstrap from zero).
 
 Next: Phase 10 (polish, docs, one-command startup).
+
+Phase 10 notes (polish & one-command startup):
+- Makefile: run / up / down / bootstrap / refresh / dev / verify /
+  verify-dq / logs / clean. `make run` = scripts/start_all.py:
+  compose up + wait healthy -> generate data if missing -> bootstrap
+  MinIO -> bootstrap Superset -> lakehouse_refresh job (all checks) ->
+  quick verification suite (5 scripts). Whole flow: ~3 min on a warm
+  machine.
+- CLI run of the refresh job: `dagster job execute` in Dagster 1.13 takes
+  -m (module) not --definitions/-f (relative imports break file mode):
+  `cd dagster_project && dagster job execute -m
+  ecommerce_lakehouse.definitions -j lakehouse_refresh`.
+- BUG FOUND & FIXED: the parallel executor scheduled cross-table checks
+  (referential integrity, 5-view revenue invariant) concurrently with
+  sibling tables' full-refresh drop windows -> intermittent
+  TABLE_NOT_FOUND (failed ~50% of runs once triggered). Fix: per-layer
+  no-op barrier assets <layer>/__layer_gate__ (factory.build_layer_gate)
+  depending on every table of the layer; the 12 cross-table checks now
+  attach to the gate, so they run only after the whole layer committed.
+  No fake lineage edges, no executor tricks; asset count 21 -> 24, check
+  count 85 unchanged (bronze 34 / silver 35 / gold 16). Verified with 3
+  consecutive green full runs + verify_dq.
+- README rewritten (architecture diagram, make targets, verification
+  matrix, design decisions, 5-minute demo script). Removed leftover dbt
+  scaffolding (dbt/ dir, dbt-core/dbt-trino requirements, .gitignore
+  entries) - transformations are Trino SQL in Dagster; also dropped
+  unused pyiceberg from requirements (all Iceberg I/O goes through Trino).
+- verify_dq EXPECTED_ASSETS 21 -> 24 (tables + gates).
+
+Project status: all phases complete; final state verified end-to-end via
+`make run` + `make verify` + `make verify-dq` (all RESULT: PASS).
 
 Phase 8 notes (data quality & observability):
 - 85 declarative Dagster asset checks in assets/checks.py (same spec-driven

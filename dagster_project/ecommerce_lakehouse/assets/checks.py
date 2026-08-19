@@ -5,6 +5,13 @@ silver and gold assets. Each spec is (asset, name, description, SQL,
 condition, blocking); the factory below turns them into check functions
 that run automatically after the asset's materialization.
 
+Checks that read more than one table (referential integrity, the
+5-view revenue invariant) are attached to the per-layer barrier asset
+(``<layer>/__layer_gate__``), which depends on every table of the layer:
+they then run only after all tables have committed, so they can never
+read a sibling table inside its full-refresh drop window (a race the
+parallel executor would otherwise schedule).
+
 Check families (per PROJECT.md Phase 8):
 - not-empty / uniqueness (PK per table)
 - completeness: bronze row counts vs the Phase 4 manifest
@@ -29,6 +36,7 @@ from dagster import AssetCheckExecutionContext
 
 from ..resources.trino import TrinoResource
 from .bronze import BRONZE_ASSETS_BY_NAME
+from .factory import GATE_NAME
 from .gold import GOLD_ASSETS_BY_NAME
 from .silver import SILVER_ASSETS_BY_NAME
 
@@ -186,7 +194,7 @@ for _t, (_col, _kind, _fresh) in _BZ_DATE_COLS.items():
 
 for _child, _col, _parent in _BZ_REFS:
     SPECS.append({
-        "layer": "bronze", "table": _child, "name": f"refs_{_parent.rsplit('.', 1)[-1]}",
+        "layer": "bronze", "table": GATE_NAME, "name": f"{_child}_refs_{_parent.rsplit('.', 1)[-1]}",
         "description": f"bronze.{_child}: every {_col} exists in {_parent}",
         "sql": _ref_sql(f"{B}.{_child}", _col, _parent),
         "condition": "zero", "blocking": True,
@@ -216,7 +224,7 @@ for _t, _col in _SV_NOT_NULL:
 
 for _child, _col, _parent in _SV_REFS:
     SPECS.append({
-        "layer": "silver", "table": _child, "name": f"refs_{_parent.rsplit('.', 1)[-1]}",
+        "layer": "silver", "table": GATE_NAME, "name": f"{_child}_refs_{_parent.rsplit('.', 1)[-1]}",
         "description": f"silver.{_child}: every {_col} exists in {_parent}",
         "sql": _ref_sql(f"{S}.{_child}", _col, _parent),
         "condition": "zero", "blocking": True,
@@ -272,7 +280,7 @@ SPECS += [
         "condition": "zero", "blocking": True,
     },
     {
-        "layer": "gold", "table": "customer_360", "name": "one_row_per_customer",
+        "layer": "gold", "table": GATE_NAME, "name": "one_row_per_customer",
         "description": "gold.customer_360: row count equals silver.dim_customers",
         "sql": (
             "SELECT (SELECT count(*) FROM iceberg.gold.customer_360) "
@@ -311,7 +319,7 @@ SPECS += [
         "condition": "zero", "blocking": False,
     },
     {
-        "layer": "gold", "table": "customer_360", "name": "revenue_invariant",
+        "layer": "gold", "table": GATE_NAME, "name": "revenue_invariant",
         "description": (
             "gross revenue agrees across silver.fct_orders, customer_360, "
             "revenue_by_channel, revenue_by_category and monthly_kpis (spread < $0.05)"

@@ -7,7 +7,8 @@ Checks:
   2. Live negative test: a deliberately failing check is recorded as
      failed (the suite is not vacuously green).
   3. Full ``lakehouse_refresh`` job run in a fresh instance:
-     all 21 assets materialize and all 85 asset checks evaluate to
+     all 24 assets (21 tables + 3 layer gates) materialize and all 85
+     asset checks evaluate to
      passed.
 
 Exit code 0 + "RESULT: PASS" when everything is green.
@@ -33,7 +34,7 @@ from dagster._core.storage.asset_check_execution_record import (  # noqa: E402
 from ecommerce_lakehouse.assets import checks as checks_mod  # noqa: E402
 from ecommerce_lakehouse.definitions import definitions  # noqa: E402
 
-EXPECTED_ASSETS = 21
+EXPECTED_ASSETS = 24  # 21 tables + 3 per-layer gate (barrier) assets
 EXPECTED_CHECKS = 85
 
 
@@ -180,7 +181,7 @@ def main() -> int:
     )
 
     # ------------------------------------------------------------------ 3.
-    print("[3] Full lakehouse_refresh run (21 assets + all asset checks)")
+    print("[3] Full lakehouse_refresh run (24 assets + all asset checks)")
     home2 = tempfile.mkdtemp(prefix="dq_full_")
     storage2 = os.path.join(home2, "storage")
     os.makedirs(storage2)

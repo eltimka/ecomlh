@@ -20,11 +20,6 @@ dagster_home/
 instance/
 .tmp_dagster_home_*/
 
-# --- dbt ---
-dbt/target/
-dbt/logs/
-dbt/dbt_packages/
-
 # --- Data artifacts (generated, not source) ---
 *.parquet
 *.arrow

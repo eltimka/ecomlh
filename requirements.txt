@@ -12,9 +12,8 @@ polars>=1.5
 pyarrow>=17.0
 numpy>=1.26            # deterministic RNG for the synthetic data generator
 
-# --- Iceberg (client-side writes; s3 extra pulls s3fs/fsspec) ---
-pyiceberg[pyarrow,s3]>=0.8
-thrift>=0.16            # required for pyiceberg Hive catalog client
+# Iceberg tables are written/queried through Trino (CTAS + hive/iceberg
+# connectors) - no Python-side Iceberg writer needed.
 
 # --- Trino client (SQL from Dagster assets, scripts, dashboard) ---
 trino>=0.338  # newer client releases (45x) cap out below Python 3.14
@@ -26,7 +25,3 @@ minio>=7.2
 # --- Utilities ---
 python-dotenv>=1.0
 requests>=2.31
-
-# --- dbt (transformations & data quality) ---
-dbt-core>=1.8
-dbt-trino>=1.8

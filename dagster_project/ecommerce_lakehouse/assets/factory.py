@@ -20,6 +20,36 @@ from dagster import AssetExecutionContext, AssetsDefinition
 
 from ..resources.trino import TrinoResource
 
+#: Name of the per-layer barrier asset that cross-table checks attach to.
+GATE_NAME = "__layer_gate__"
+
+
+def build_layer_gate(layer: str, table_assets: dict[str, AssetsDefinition]) -> AssetsDefinition:
+    """No-op barrier asset depending on every table of the layer.
+
+    Cross-table data-quality checks (referential integrity, cross-table
+    invariants) attach to this asset instead of a single table: they only
+    run once ALL tables of the layer have committed in the current run.
+    Without the barrier, a check on table A could read table B while B is
+    inside its full-refresh drop window (drop + CTAS) - a race the
+    parallel executor would happily schedule.
+    """
+
+    @dg.asset(
+        key_prefix=(layer,),
+        name=GATE_NAME,
+        deps=list(table_assets.values()),
+        description=(
+            f"Barrier: all {layer} tables committed in this run. "
+            "Cross-table DQ checks (referential integrity, invariants) "
+            "run here - see assets/checks.py."
+        ),
+    )
+    def layer_gate() -> None:
+        return None
+
+    return layer_gate
+
 
 def build_layer_assets(
     layer: str,
@@ -45,6 +75,9 @@ def build_layer_assets(
         asset = _layer_asset(layer, spec, deps)
         assets.append(asset)
         local[spec["name"]] = asset
+    gate = build_layer_gate(layer, local)
+    assets.append(gate)
+    local[GATE_NAME] = gate
     return assets, local
 
 

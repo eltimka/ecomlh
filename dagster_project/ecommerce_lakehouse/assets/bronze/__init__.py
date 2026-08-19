@@ -22,6 +22,7 @@ import dagster as dg
 import polars as pl
 from dagster import AssetExecutionContext
 
+from ..factory import GATE_NAME, build_layer_gate
 from ...resources.minio import MinioResource
 from ...resources.trino import TrinoResource
 
@@ -148,3 +149,9 @@ bronze_assets = [_bronze_asset(table) for table in BRONZE_TABLES]
 
 #: table name -> asset definition, for wiring downstream `deps=[...]` (lineage)
 BRONZE_ASSETS_BY_NAME = {a.key.path[-1]: a for a in bronze_assets}
+
+# Barrier asset for cross-table checks (referential integrity between
+# bronze tables runs only after every bronze table is committed).
+_bronze_gate = build_layer_gate("bronze", BRONZE_ASSETS_BY_NAME)
+BRONZE_ASSETS_BY_NAME[GATE_NAME] = _bronze_gate
+bronze_assets.append(_bronze_gate)
