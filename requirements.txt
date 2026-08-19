@@ -27,10 +27,6 @@ minio>=7.2
 python-dotenv>=1.0
 requests>=2.31
 
-# --- Dashboard (Streamlit) ---
-streamlit>=1.36
-altair>=5.3
-
 # --- dbt (transformations & data quality) ---
 dbt-core>=1.8
 dbt-trino>=1.8

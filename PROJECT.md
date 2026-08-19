@@ -43,7 +43,7 @@ Transformations (dbt-trino or Trino SQL in Dagster)
         ↓
 Gold Customer 360 marts
         ↓
-Streamlit / Superset dashboard
+Superset dashboard
 ```
 
 ## Tech Stack (Locked)
@@ -58,7 +58,7 @@ Streamlit / Superset dashboard
 | Data Processing    | Polars + PyArrow              | Fast local processing                      |
 | Transformations    | dbt-trino (preferred) or pure Trino SQL |                                 |
 | Data Quality       | dbt tests + Dagster asset checks |                                      |
-| Dashboard          | Streamlit (primary)           | Optional: Superset later                   |
+| Dashboard          | Apache Superset             | Local BI on top of Trino, dashboards as JSON |
 | Language           | Python 3.11+                  |                                            |
 
 ## Project Structure (Target)
@@ -95,7 +95,7 @@ ecommerce-customer-360-lakehouse/
 ├── data_generator/
 │   └── generate_synthetic.py
 ├── dashboard/
-│   └── app.py
+│   └── dashboards/          # Superset dashboard JSON exports (loaded via REST API)
 ├── scripts/
 │   ├── bootstrap_minio.py
 │   └── create_schemas.sql
@@ -192,13 +192,27 @@ Build the core analytical models:
 - Basic freshness, uniqueness, not-null, referential integrity
 - Optional: simple anomaly detection
 
-### Phase 9 – Dashboard
-- Streamlit app that connects to Trino and visualizes:
-  - Customer 360 overview
-  - LTV distribution
-  - Churn risk
-  - Revenue trends
-  - Key metrics
+### Phase 9 – Dashboard (Apache Superset)
+- Add an `apache/superset` service to the Docker Compose stack (UI on port 8088):
+  - Reuse the existing Postgres container for Superset's metadb (separate
+    `superset` database; no extra containers)
+  - Local-only admin user (documented, local use only)
+- Register **Trino as a Superset database** (SQLAlchemy URI
+  `trino://<user>@localhost:8080/<catalog>`) so Superset queries the Iceberg
+  marts directly - no copy into a warehouse
+- Dashboards & charts are built **deterministically**: chart/dashboard JSON is
+  committed under `dashboard/dashboards/` and loaded by a bootstrap script via
+  the Superset REST API (idempotent, re-runnable):
+  - Customer 360 overview (KPIs: customers, orders, GMV, AOV)
+  - LTV distribution (from `gold.customer_360`)
+  - Churn risk breakdown
+  - Revenue trends (monthly, by channel)
+  - RFM segment mix
+- Success criteria:
+  - `superset` container healthy, UI reachable at http://localhost:8088
+  - Trino database registered and queryable inside Superset
+  - Dashboards exist with charts rendering gold-layer data
+  - `scripts/verify_dashboard.py` → RESULT: PASS
 
 ### Phase 10 – Polish
 - Good README with architecture diagram and how to run
@@ -269,7 +283,7 @@ Phase 8 notes (data quality & observability):
 - Verify: python scripts/verify_dq.py (18 condition unit tests + live
   negative test + full lakehouse_refresh: 21 assets, 85/85 checks PASS).
 
-Next: Phase 9 (Streamlit dashboard).
+Next: Phase 9 (Apache Superset dashboard).
 
 Phase 7 notes (gold layer - Customer 360):
 - 4 assets in iceberg.gold, all reading silver:

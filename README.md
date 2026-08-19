@@ -30,7 +30,7 @@ Trino Query Engine
         ↓
 Gold Customer 360 Marts
         ↓
-Streamlit Dashboard
+Superset Dashboard
 ```
 
 ## Tech Stack
@@ -44,7 +44,7 @@ Streamlit Dashboard
 | Query Engine       | Trino                     |
 | Transformations    | dbt-trino / Trino SQL     |
 | Processing         | Polars + PyArrow          |
-| Dashboard          | Streamlit                 |
+| Dashboard          | Apache Superset           |
 | Infrastructure     | Docker Compose            |
 
 ## Project Structure
@@ -55,7 +55,7 @@ ecommerce-customer-360-lakehouse/
 ├── dagster_project/         # Dagster assets & resources
 ├── dbt/                     # dbt models (optional)
 ├── data_generator/          # Synthetic data generator
-├── dashboard/               # Streamlit app
+├── dashboard/               # Superset dashboard JSON exports
 ├── scripts/                 # Bootstrap & helper scripts
 ├── PROJECT.md               # Detailed build plan (for AI agents)
 └── README.md
@@ -89,9 +89,9 @@ dagster dev
 
 # 4. Materialize assets from the Dagster UI (http://localhost:3000)
 
-# 5. Run the dashboard
-cd ../dashboard
-streamlit run app.py
+# 5. Bootstrap the Superset dashboard (Trino connection + dashboards)
+.venv/bin/python scripts/bootstrap_superset.py
+# then open http://localhost:8088
 ```
 
 ## Key Features
