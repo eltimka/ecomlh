@@ -1,0 +1,42 @@
+[
+  {
+    "name": "kpi_customers",
+    "sql": "SELECT COUNT(*) AS value FROM iceberg.gold.customer_360"
+  },
+  {
+    "name": "kpi_orders",
+    "sql": "SELECT SUM(orders) AS value FROM iceberg.gold.monthly_kpis"
+  },
+  {
+    "name": "kpi_gmv",
+    "sql": "SELECT SUM(gross_revenue) AS value FROM iceberg.gold.revenue_by_channel"
+  },
+  {
+    "name": "kpi_aov",
+    "sql": "SELECT SUM(net_revenue) / SUM(valid_orders) AS value FROM iceberg.gold.revenue_by_channel"
+  },
+  {
+    "name": "ltv_distribution",
+    "sql": "SELECT CASE WHEN net_revenue <= 0 THEN '0. no revenue' WHEN net_revenue < 50 THEN '1. < 50' WHEN net_revenue < 250 THEN '2. 50-250' WHEN net_revenue < 500 THEN '3. 250-500' WHEN net_revenue < 1000 THEN '4. 500-1k' WHEN net_revenue < 2500 THEN '5. 1k-2.5k' WHEN net_revenue < 5000 THEN '6. 2.5k-5k' ELSE '7. 5k+' END AS ltv_bucket, COUNT(*) AS customers FROM iceberg.gold.customer_360 GROUP BY 1"
+  },
+  {
+    "name": "churn_risk_mix",
+    "sql": "SELECT churn_risk, COUNT(*) AS customers FROM iceberg.gold.customer_360 GROUP BY 1"
+  },
+  {
+    "name": "rfm_segment_mix",
+    "sql": "SELECT rfm_segment, COUNT(*) AS customers FROM iceberg.gold.customer_360 GROUP BY 1"
+  },
+  {
+    "name": "revenue_trend",
+    "sql": "SELECT month, SUM(gross_revenue) AS gross_revenue, SUM(net_revenue) AS net_revenue FROM iceberg.gold.revenue_by_channel GROUP BY 1"
+  },
+  {
+    "name": "channel_mix",
+    "sql": "SELECT channel, SUM(net_revenue) AS net_revenue FROM iceberg.gold.revenue_by_channel GROUP BY 1"
+  },
+  {
+    "name": "category_mix",
+    "sql": "SELECT category, SUM(gross_revenue) AS gross_revenue FROM iceberg.gold.revenue_by_category GROUP BY 1"
+  }
+]

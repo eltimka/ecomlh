@@ -1,0 +1,16 @@
+{
+  "title": "Customer 360",
+  "description": "Customer 360 overview over the gold layer (Trino + Iceberg on MinIO)",
+  "layout": [
+    { "chart": "kpi_customers", "x": 0, "y": 0, "w": 3, "h": 3 },
+    { "chart": "kpi_orders",    "x": 3, "y": 0, "w": 3, "h": 3 },
+    { "chart": "kpi_gmv",       "x": 6, "y": 0, "w": 3, "h": 3 },
+    { "chart": "kpi_aov",       "x": 9, "y": 0, "w": 3, "h": 3 },
+    { "chart": "revenue_trend",  "x": 0, "y": 3, "w": 8, "h": 5 },
+    { "chart": "churn_risk_mix", "x": 8, "y": 3, "w": 4, "h": 5 },
+    { "chart": "ltv_distribution", "x": 0, "y": 8, "w": 6, "h": 5 },
+    { "chart": "rfm_segment_mix",  "x": 6, "y": 8, "w": 6, "h": 5 },
+    { "chart": "channel_mix",    "x": 0, "y": 13, "w": 6, "h": 5 },
+    { "chart": "category_mix",   "x": 6, "y": 13, "w": 6, "h": 5 }
+  ]
+}

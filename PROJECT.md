@@ -249,10 +249,50 @@ Build the core analytical models:
 
 ---
 
-**Current status:** Phases 0-8 complete (scaffold, Docker Compose infrastructure,
+**Current status:** Phases 0-9 complete (scaffold, Docker Compose infrastructure,
 bootstrap lakehouse, Dagster project setup, synthetic data generator,
 bronze layer ingestion, silver layer transformations, gold Customer 360 marts,
-data quality & observability).
+data quality & observability, Apache Superset dashboard).
+
+Phase 9 notes (Apache Superset dashboard):
+- apache/superset:4.1.1 service in the compose stack (UI port 8088; the
+  in-container web server also listens on 8088 - healthcheck must use 8088,
+  not 8888). Metadb = dedicated `superset` database in the shared Postgres
+  container. Child image docker/superset/Dockerfile adds psycopg2-binary +
+  sqlalchemy-trino (the 4.x base image ships no DB drivers; the Trino dialect
+  PyPI project is `sqlalchemy-trino`, not `trino-sqlalchemy`).
+- Dashboards-as-code: dashboard/dashboards/{datasets,charts,dashboard}.json
+  are the source of truth; scripts/bootstrap_superset.py loads them via the
+  REST API and is idempotent + self-healing (compares SQL/query_context and
+  PUTs changed objects; re-lays the dashboard tiles on every run).
+- Design: 10 small SQL mart datasets (virtual datasets over iceberg.gold,
+  fully qualified table names) + 10 charts (4 KPI BIG_NUMBERs, LTV
+  distribution, churn/RFM/channel/category mixes, monthly revenue trend)
+  in one published "Customer 360" dashboard. Charts aggregate plain columns
+  of the SQL marts with ad-hoc SQL metrics - this sidesteps 4.1's strict
+  query-context schema (string metrics must be predefined; arbitrary SQL
+  needs ad-hoc objects; CASE expressions cannot be groupby columns).
+- 4.1 REST API gotchas (all hit live): login is a flat JSON body (no
+  jsonrpc); token response is flat {access_token}; CSRF token (GET
+  /api/v1/security/csrf_token/) required on writes as X-CSRFToken; list
+  filter rison syntax unreliable - page_size:100 + client-side match
+  instead; chart query_context/params are JSON *strings*; datasource.id is
+  the plain integer; dashboard layout = json_metadata.positions dict with
+  meta.chartId (no DASHBOARD_CLOUD_CHART_DATA, no chart-association
+  endpoint - the PUT syncs dashboard_slices); sqllab execute needs
+  database_id + sql and client_id <= 11 chars (metadb varchar(11)).
+- superset init (not bare db upgrade) is required once: it seeds roles/
+  permissions (without it every API call is 403 even as Admin).
+- config.py: no SERVER_NAME (it silently 404s every route when requests
+  carry a non-default port); no examples; local admin/admin user.
+- Verified: scripts/verify_dashboard.py (RESULT: PASS) - container health,
+  login, SELECT 1 through Superset->Trino, 10 datasets, all 10 charts
+  render via GET /api/v1/chart/<id>/data/ with real rows (GMV tile =
+  $15,221,141.27, matching the Phase 7 5-view invariant), dashboard tiles
+  all reference existing charts. Fresh-metadb rebuild tested (drop DB ->
+  full re-bootstrap from zero).
+
+Next: Phase 10 (polish, docs, one-command startup).
 
 Phase 8 notes (data quality & observability):
 - 85 declarative Dagster asset checks in assets/checks.py (same spec-driven
@@ -283,7 +323,7 @@ Phase 8 notes (data quality & observability):
 - Verify: python scripts/verify_dq.py (18 condition unit tests + live
   negative test + full lakehouse_refresh: 21 assets, 85/85 checks PASS).
 
-Next: Phase 9 (Apache Superset dashboard).
+Next: Phase 10 (polish - README/docs, one-command startup).
 
 Phase 7 notes (gold layer - Customer 360):
 - 4 assets in iceberg.gold, all reading silver:
