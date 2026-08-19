@@ -7,7 +7,7 @@ Steps (each idempotent - safe to re-run at any time):
   1. docker compose up -d + wait until the stack is healthy
   2. generate synthetic data if data/synthetic/ is missing
   3. bootstrap MinIO buckets + Trino schemas
-  4. bootstrap Superset (Trino connection + Customer 360 dashboard)
+  4. start the Streamlit Customer 360 dashboard (port 8501)
   5. run the lakehouse_refresh Dagster job (bronze -> silver -> gold
      with all 85 data-quality checks)
   6. run the quick verification suite
@@ -17,9 +17,8 @@ The heavy DQ verification (scripts/verify_dq.py - a second full refresh
 run) is left out of the fast path; run `make verify-dq` for it.
 
 At the end you get:
+  - Customer 360 dashboard: http://localhost:8501  (Streamlit)
   - Dagster UI:    http://localhost:3000  (start with `make dev`)
-  - Superset UI:   http://localhost:8088  (login admin / admin,
-                      dashboard "Customer 360")
   - Trino:         localhost:8080 (user: admin, catalog: iceberg)
   - MinIO console: http://localhost:9001 (minioadmin / minioadmin)
 """
@@ -30,15 +29,18 @@ import os
 import subprocess
 import sys
 import time
+import urllib.request
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 COMPOSE = ["docker", "compose", "-f", str(REPO_ROOT / "docker" / "docker-compose.yml")]
 VENV = REPO_ROOT / ".venv" / "bin"
 DAGSTER_PROJECT = REPO_ROOT / "dagster_project"
+LOGS_DIR = REPO_ROOT / ".logs"
+DASHBOARD_PORT = int(os.environ.get("STREAMLIT_PORT", "8501"))
 
 # long-running services that must be (healthy); one-shot inits may be Exited (0)
-LONG_RUNNING = {"minio", "lakehouse-postgres", "hive-metastore", "trino", "superset"}
+LONG_RUNNING = {"minio", "lakehouse-postgres", "hive-metastore", "trino"}
 
 
 def run(cmd: list[str], cwd: Path | None = None, **kw) -> subprocess.CompletedProcess:
@@ -116,13 +118,59 @@ def step_bootstrap() -> None:
         fail("minio bootstrap failed")
 
 
-def step_superset() -> None:
+def dashboard_health_ok() -> bool:
+    url = f"http://localhost:{DASHBOARD_PORT}/_stcore/health"
+    try:
+        with urllib.request.urlopen(url, timeout=3) as r:
+            return r.status == 200
+    except Exception:
+        return False
+
+
+def stop_dashboard() -> None:
+    """Stop a previously started dashboard process (pid file based)."""
+    pid_file = LOGS_DIR / "dashboard.pid"
+    if not pid_file.exists():
+        return
+    try:
+        os.kill(int(pid_file.read_text().strip()), 15)
+    except (ValueError, OSError):
+        pass
+    pid_file.unlink(missing_ok=True)
+
+
+def step_dashboard() -> None:
     print("=" * 62)
-    print("[4/6] bootstrap Superset (Trino connection + Customer 360 dashboard)")
+    print(f"[4/6] Streamlit Customer 360 dashboard (port {DASHBOARD_PORT})")
     print("=" * 62)
-    proc = run([str(VENV / "python"), "scripts/bootstrap_superset.py"])
-    if proc.returncode != 0:
-        fail("superset bootstrap failed")
+    if dashboard_health_ok():
+        print(f"  already running at http://localhost:{DASHBOARD_PORT} - skipping")
+        return
+    stop_dashboard()
+    LOGS_DIR.mkdir(exist_ok=True)
+    log = (LOGS_DIR / "dashboard.log").open("a")
+    proc = subprocess.Popen(
+        [
+            str(VENV / "streamlit"), "run", str(REPO_ROOT / "dashboard" / "app.py"),
+            "--server.port", str(DASHBOARD_PORT),
+            "--server.address", "localhost",
+            "--server.headless", "true",
+        ],
+        cwd=str(REPO_ROOT),
+        stdout=log,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+    (LOGS_DIR / "dashboard.pid").write_text(str(proc.pid))
+    deadline = time.time() + 120
+    while time.time() < deadline:
+        if dashboard_health_ok():
+            print(f"  dashboard up at http://localhost:{DASHBOARD_PORT} (pid {proc.pid})")
+            return
+        if proc.poll() is not None:
+            fail("streamlit exited during startup - see .logs/dashboard.log")
+        time.sleep(2)
+    fail(f"dashboard did not become healthy in time - see .logs/dashboard.log")
 
 
 def step_refresh() -> None:
@@ -165,16 +213,16 @@ def main() -> None:
     step_up()
     step_data()
     step_bootstrap()
-    step_superset()
+    step_dashboard()
     step_refresh()
     step_verify()
     print("\n" + "=" * 62)
     print("Lakehouse is ready. Open:")
-    print("  Superset dashboard : http://localhost:8088  (admin / admin)")
-    print("  Dagster UI         : .venv/bin/dagster dev  -> http://localhost:3000")
-    print("  Trino              : localhost:8080 (user: admin, catalog: iceberg)")
-    print("  MinIO console      : http://localhost:9001 (minioadmin / minioadmin)")
-    print(f"  Full DQ suite      : make verify-dq   (took {time.time() - t0:.0f}s total)")
+    print(f"  Customer 360 dashboard : http://localhost:{DASHBOARD_PORT}  (Streamlit)")
+    print("  Dagster UI             : .venv/bin/dagster dev  -> http://localhost:3000")
+    print("  Trino                  : localhost:8080 (user: admin, catalog: iceberg)")
+    print("  MinIO console          : http://localhost:9001 (minioadmin / minioadmin)")
+    print(f"  Full DQ suite          : make verify-dq   (took {time.time() - t0:.0f}s total)")
     print("=" * 62)
 
 

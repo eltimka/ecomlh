@@ -31,3 +31,6 @@ data/
 .DS_Store
 .idea/
 .vscode/
+
+# --- Local service logs / pid files ---
+.logs/

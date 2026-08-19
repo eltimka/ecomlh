@@ -12,7 +12,7 @@
 
 VENV := $(CURDIR)/.venv/bin
 
-.PHONY: run up down bootstrap refresh dev verify verify-dq logs clean
+.PHONY: run up down bootstrap refresh dev dashboard verify verify-dq logs clean
 
 ## run: one-command end-to-end startup (compose up -> data -> bootstrap ->
 ##      full refresh with all checks -> quick verification suite)
@@ -24,14 +24,14 @@ up:
 	docker compose -f docker/docker-compose.yml up -d
 	docker compose -f docker/docker-compose.yml ps
 
-## down: stop the docker stack (data volumes are kept)
+## down: stop the docker stack and the dashboard (data volumes are kept)
 down:
 	docker compose -f docker/docker-compose.yml down
+	@if [ -f .logs/dashboard.pid ]; then kill `cat .logs/dashboard.pid` 2>/dev/null; rm -f .logs/dashboard.pid; echo "dashboard stopped"; fi
 
-## bootstrap: MinIO buckets + Trino schemas + Superset (idempotent)
+## bootstrap: MinIO buckets + Trino schemas (idempotent)
 bootstrap:
 	$(VENV)/python scripts/bootstrap_minio.py
-	$(VENV)/python scripts/bootstrap_superset.py
 
 ## refresh: materialize bronze -> silver -> gold with all 85 DQ checks
 refresh:
@@ -40,6 +40,11 @@ refresh:
 ## dev: Dagster UI on http://localhost:3000
 dev:
 	cd dagster_project && $(VENV)/dagster dev
+
+## dashboard: Streamlit Customer 360 dashboard on http://localhost:8501
+dashboard:
+	mkdir -p .logs
+	$(VENV)/streamlit run dashboard/app.py --server.port 8501 --server.address localhost
 
 ## verify: quick verification suite (queries only, no re-materialization)
 verify:

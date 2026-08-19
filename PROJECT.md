@@ -43,7 +43,7 @@ Transformations (dbt-trino or Trino SQL in Dagster)
         ↓
 Gold Customer 360 marts
         ↓
-Superset dashboard
+Streamlit dashboard (live Trino queries, port 8501)
 ```
 
 ## Tech Stack (Locked)
@@ -58,7 +58,7 @@ Superset dashboard
 | Data Processing    | Polars + PyArrow              | Fast local processing                      |
 | Transformations    | dbt-trino (preferred) or pure Trino SQL |                                 |
 | Data Quality       | dbt tests + Dagster asset checks |                                      |
-| Dashboard          | Apache Superset             | Local BI on top of Trino, dashboards as JSON |
+| Dashboard          | Streamlit + Plotly        | Thin local app querying Trino live (v1 was Superset, see notes) |
 | Language           | Python 3.11+                  |                                            |
 
 ## Project Structure (Target)
@@ -95,7 +95,8 @@ ecommerce-customer-360-lakehouse/
 ├── data_generator/
 │   └── generate_synthetic.py
 ├── dashboard/
-│   └── dashboards/          # Superset dashboard JSON exports (loaded via REST API)
+│   ├── app.py               # Streamlit dashboard (KPIs + 6 charts + profiles)
+│   └── marts.py             # the 11 gold-layer mart queries (single source of truth)
 ├── scripts/
 │   ├── bootstrap_minio.py
 │   └── create_schemas.sql
@@ -192,27 +193,25 @@ Build the core analytical models:
 - Basic freshness, uniqueness, not-null, referential integrity
 - Optional: simple anomaly detection
 
-### Phase 9 – Dashboard (Apache Superset)
-- Add an `apache/superset` service to the Docker Compose stack (UI on port 8088):
-  - Reuse the existing Postgres container for Superset's metadb (separate
-    `superset` database; no extra containers)
-  - Local-only admin user (documented, local use only)
-- Register **Trino as a Superset database** (SQLAlchemy URI
-  `trino://<user>@localhost:8080/<catalog>`) so Superset queries the Iceberg
-  marts directly - no copy into a warehouse
-- Dashboards & charts are built **deterministically**: chart/dashboard JSON is
-  committed under `dashboard/dashboards/` and loaded by a bootstrap script via
-  the Superset REST API (idempotent, re-runnable):
-  - Customer 360 overview (KPIs: customers, orders, GMV, AOV)
-  - LTV distribution (from `gold.customer_360`)
-  - Churn risk breakdown
-  - Revenue trends (monthly, by channel)
-  - RFM segment mix
+### Phase 9 – Dashboard (Streamlit; v1 was Apache Superset)
+- v1 (superseded): Apache Superset in Docker, Trino as database, dashboard
+  built deterministically via the REST API. The API-level checks all passed,
+  but charts created via API could not be rendered by the 4.1 frontend
+  (legacy-viz registry keys + form_data/query-context format mismatches).
+- v2 (final): a thin **Streamlit** app in the local venv
+  (`dashboard/app.py` + `dashboard/marts.py`):
+  - queries the gold marts **live** through the same Trino client the
+    pipeline uses - no extra container, no metadb, no REST bootstrap
+  - 4 KPI cards (customers/orders/GMV/AOV), monthly revenue trend,
+    LTV distribution, churn-risk pie, RFM segment mix, channel mix,
+    category mix, top-25 customer profile table
+  - 5-minute query cache + manual refresh button; friendly error if the
+    stack is down
 - Success criteria:
-  - `superset` container healthy, UI reachable at http://localhost:8088
-  - Trino database registered and queryable inside Superset
-  - Dashboards exist with charts rendering gold-layer data
-  - `scripts/verify_dashboard.py` → RESULT: PASS
+  - dashboard serving at http://localhost:8501 (started by `make run` / `make dashboard`)
+  - KPI row shows the deterministic seed-42 values
+  - `scripts/verify_dashboard.py` → RESULT: PASS (all 11 marts execute on
+    Trino, KPI invariants hold, app health → 200)
 
 ### Phase 10 – Polish
 - Good README with architecture diagram and how to run
@@ -252,10 +251,37 @@ Build the core analytical models:
 **Current status:** Phases 0-10 complete - project done (scaffold, Docker Compose
 infrastructure, bootstrap lakehouse, Dagster project setup, synthetic data
 generator, bronze layer ingestion, silver layer transformations, gold
-Customer 360 marts, data quality & observability, Apache Superset dashboard,
-polish & one-command startup).
+Customer 360 marts, data quality & observability, Streamlit dashboard
+(v1 Superset, superseded), polish & one-command startup).
 
-Phase 9 notes (Apache Superset dashboard):
+Phase 9 notes (v2: Streamlit - final dashboard):
+- dashboard/marts.py = the 11 gold-layer mart queries (single source of
+  truth for the dashboard SQL); dashboard/app.py renders 4 KPI cards +
+  6 Plotly charts + a top-25 customer profile table, querying Trino live
+  (same trino client as the Dagster TrinoResource). st.cache_data(ttl=300)
+  + sidebar refresh button.
+- Start: `make dashboard` (foreground) or via `make run` (start_all.py
+  step 4 launches it detached on :8501, pid in .logs/dashboard.pid, log in
+  .logs/dashboard.log; `make down` stops it). Health: /_stcore/health.
+- verify_dashboard.py: executes all 11 marts on Trino, asserts the
+  deterministic seed-42 invariants (customers 5,000; orders 50,000;
+  GMV 15,221,141.27; 12 trend months; 3 channels; 8 categories), then
+  checks the app health endpoint (auto-starts a throwaway headless
+  instance if the dashboard is not running, and stops it afterwards).
+- Why not Superset (see v1 notes below for the deep dive): API-created
+  charts cannot be rendered by the 4.1 frontend - the dashboard grid
+  rebuilds each chart's query from `form_data` and looks the viz up in a
+  plugin registry keyed by legacy snake_case keys (`big_number`, `bar`,
+  `pie`); the 4.x form_data contract (dimensions in `columns`, ad-hoc
+  metric objects in `metrics`) is not documented and diverges from the
+  backend query-context contract; the legacy `big_number` viz also forces
+  `is_timeseries: true` (trendline) which requires a datetime column. The
+  backend was fine all along (full query contexts returned correct data) -
+  it was the 4.1 frontend's legacy-viz path that was unfriendly to
+  API-created charts. For a 100% local portfolio project, a thin
+  Streamlit app is simpler and fully under our control.
+
+Phase 9 notes (v1: Apache Superset - superseded, kept for the lessons):
 - apache/superset:4.1.1 service in the compose stack (UI port 8088; the
   in-container web server also listens on 8088 - healthcheck must use 8088,
   not 8888). Metadb = dedicated `superset` database in the shared Postgres
@@ -296,12 +322,12 @@ Phase 9 notes (Apache Superset dashboard):
 Next: Phase 10 (polish, docs, one-command startup).
 
 Phase 10 notes (polish & one-command startup):
-- Makefile: run / up / down / bootstrap / refresh / dev / verify /
-  verify-dq / logs / clean. `make run` = scripts/start_all.py:
+- Makefile: run / up / down / bootstrap / refresh / dev / dashboard /
+  verify / verify-dq / logs / clean. `make run` = scripts/start_all.py:
   compose up + wait healthy -> generate data if missing -> bootstrap
-  MinIO -> bootstrap Superset -> lakehouse_refresh job (all checks) ->
-  quick verification suite (5 scripts). Whole flow: ~3 min on a warm
-  machine.
+  MinIO -> start Streamlit dashboard (:8501) -> lakehouse_refresh job
+  (all checks) -> quick verification suite (5 scripts). Whole flow:
+  ~3 min on a warm machine.
 - CLI run of the refresh job: `dagster job execute` in Dagster 1.13 takes
   -m (module) not --definitions/-f (relative imports break file mode):
   `cd dagster_project && dagster job execute -m
