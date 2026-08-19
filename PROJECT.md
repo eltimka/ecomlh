@@ -235,9 +235,41 @@ Build the core analytical models:
 
 ---
 
-**Current status:** Phases 0-7 complete (scaffold, Docker Compose infrastructure,
+**Current status:** Phases 0-8 complete (scaffold, Docker Compose infrastructure,
 bootstrap lakehouse, Dagster project setup, synthetic data generator,
-bronze layer ingestion, silver layer transformations, gold Customer 360 marts).
+bronze layer ingestion, silver layer transformations, gold Customer 360 marts,
+data quality & observability).
+
+Phase 8 notes (data quality & observability):
+- 85 declarative Dagster asset checks in assets/checks.py (same spec-driven
+  pattern as the layers): SQL + condition + blocking flag per check.
+  Families: not-empty, PK uniqueness (blocking), bronze row counts vs the
+  Phase 4 manifest (blocking), freshness (date columns vs DATA_DATE_*),
+  referential integrity (blocking, bronze + silver), silver business rules
+  (payment conflicts, line-total arithmetic, amount mismatches, negative
+  refund lag, ticket-link validity), gold invariants (score/segment/churn
+  domains, 1:1 customer coverage, 5-view revenue invariant - blocking),
+  and simple anomaly detection (|z| > 3 on monthly order counts).
+- Freshness semantics are per-table: dense tables must cover the full data
+  range; refunds only from-within-range and fresh-up-to-end (no upper bound
+  - refund lag is realistic); sparse tables (support_tickets, 300 rows)
+  only need the newest row within 7 days of the range end. (Both were
+  discovered by the test suite itself on first run.)
+- Checks run via asset JOBS (dagster_project/.../definitions.py adds
+  bronze_refresh / silver_refresh / gold_refresh / lakehouse_refresh):
+  the in-process materialize() helper skips check steps, but a resolved
+  asset job includes them as ops; a failed BLOCKING check fails the run
+  (DagsterAssetCheckFailedError) and stops downstream assets.
+- 1.13 API notes: decorator is dg.asset_check (not asset_check_spec),
+  result class is dg.AssetCheckResult; AssetSelection.key_prefixes (plural),
+  AssetSelection.assets (keys is deprecated); RepositoryDefinition is built
+  via Definitions.get_repository_def(); DagsterInstance has no
+  events_for_run - use get_latest_asset_check_evaluation_record per check
+  key (status SUCCEEDED/FAILED).
+- Verify: python scripts/verify_dq.py (18 condition unit tests + live
+  negative test + full lakehouse_refresh: 21 assets, 85/85 checks PASS).
+
+Next: Phase 9 (Streamlit dashboard).
 
 Phase 7 notes (gold layer - Customer 360):
 - 4 assets in iceberg.gold, all reading silver:
@@ -262,7 +294,8 @@ Phase 7 notes (gold layer - Customer 360):
   a 5-view gross-revenue invariant (fct_orders = customer_360 = by_channel
   = by_category = monthly_kpis, exact to the cent).
 
-Next: Phase 8 (data quality & observability - Dagster asset checks).
+Next: Phase 8 (data quality & observability - Dagster asset checks) - done,
+see Phase 8 notes above.
 
 Phase 6 notes (silver layer):
 - 9 assets: 3 dimensions (dim_customers, dim_products, dim_order_dates) +
