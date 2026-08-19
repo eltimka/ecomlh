@@ -23,7 +23,10 @@ and visualized in a local **Streamlit** dashboard.
   ($15,221,141.27 for seed 42) that the dashboard renders back
 - **Dashboard as code** — the entire dashboard is committed Python
   (`dashboard/marts.py` + `dashboard/app.py`): every chart is a versioned
-  Trino query, no manual configuration, no extra service
+  Trino query with push-down filters, no manual configuration, no extra
+  service
+- **Re-seedable data** — `make reseed SEED=<n>` regenerates the dataset and
+  re-runs the whole pipeline; seed 42 is bit-reproducible end to end
 - **Reproducibility** — deterministic synthetic data (seeded, per-entity RNG
   streams, Zipf skew, seasonality, realistic refund/churn behavior)
 
@@ -123,7 +126,7 @@ Then:
 
 | Open                              | What to see                                                    |
 |-----------------------------------|----------------------------------------------------------------|
-| http://localhost:8501               | "Customer 360" dashboard: KPIs, LTV distribution, churn/RFM mixes, revenue trend, channel/category, customer profiles |
+| http://localhost:8501               | "Customer 360" dashboard: KPIs, LTV distribution, churn/RFM mixes, revenue trend, channel/category, customer profiles. **Interactive**: order-channel / acquisition-channel / churn-risk / month-range filters + customer search - every change re-queries Trino |
 | `make dev` → http://localhost:3000  | Dagster: asset graph, runs, 85 check results                   |
 | http://localhost:9001 (minioadmin/minioadmin) | bronze/silver/gold buckets with Iceberg metadata/data |
 
@@ -152,8 +155,29 @@ cd ..   # bronze→silver→gold + 85 checks
 | `make dashboard`  | Streamlit Customer 360 dashboard on :8501 (foreground)         |
 | `make verify`     | quick verification suite (all layers + dashboard)              |
 | `make verify-dq`  | heavy DQ suite: check-unit tests + failure-path test + full re-run |
+| `make reseed SEED=<n>` | regenerate synthetic data with a new seed, re-run the full pipeline + verification (42 = canonical dataset) |
 | `make logs`       | tail all service logs                                          |
 | `make clean`      | stack down **+ volume deletion** + generated data (full reset) |
+
+## Changing the data (re-seeding)
+
+The dataset is deterministic: `DATA_SEED` (default 42) drives a master PCG64
+RNG with per-entity child streams, so the same seed always produces
+bit-identical Parquet and therefore bit-identical gold marts. That is why
+refreshing the pipeline never changes the numbers - refresh re-materializes,
+it does not mutate.
+
+To see the whole pipeline react to *new* data:
+
+```bash
+make reseed SEED=123     # regenerate + full pipeline (all 85 checks) + verify
+# open http://localhost:8501 - every KPI, mix and trend now differs
+make reseed SEED=42      # restore the canonical dataset (bit-identical)
+```
+
+`scripts/verify_dashboard.py` is seed-aware: expected row counts come from
+`data/synthetic/manifest.json` and the GMV invariant is a cross-layer check
+(gold revenue vs silver valid-order revenue), so any seed verifies.
 
 ## Verification
 

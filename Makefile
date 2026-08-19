@@ -12,7 +12,7 @@
 
 VENV := $(CURDIR)/.venv/bin
 
-.PHONY: run up down bootstrap refresh dev dashboard verify verify-dq logs clean
+.PHONY: run up down bootstrap refresh dev dashboard reseed verify verify-dq logs clean
 
 ## run: one-command end-to-end startup (compose up -> data -> bootstrap ->
 ##      full refresh with all checks -> quick verification suite)
@@ -36,6 +36,15 @@ bootstrap:
 ## refresh: materialize bronze -> silver -> gold with all 85 DQ checks
 refresh:
 	cd dagster_project && $(VENV)/dagster job execute -m ecommerce_lakehouse.definitions -j lakehouse_refresh
+
+## reseed: regenerate synthetic data with a new seed and re-run the pipeline
+## usage: make reseed SEED=123   (SEED=42 restores the canonical dataset)
+reseed:
+	@test -n "$(SEED)" || { echo "usage: make reseed SEED=<n>   (42 = canonical dataset)"; exit 1; }
+	rm -rf data/synthetic
+	$(VENV)/python data_generator/generate_synthetic.py --seed $(SEED)
+	$(MAKE) refresh
+	$(MAKE) verify
 
 ## dev: Dagster UI on http://localhost:3000
 dev:

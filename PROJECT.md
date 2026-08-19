@@ -268,6 +268,25 @@ Phase 9 notes (v2: Streamlit - final dashboard):
   GMV 15,221,141.27; 12 trend months; 3 channels; 8 categories), then
   checks the app health endpoint (auto-starts a throwaway headless
   instance if the dashboard is not running, and stops it afterwards).
+- Interactivity (post-v2): the sidebar filters (order channel,
+  acquisition channel, churn risk, month range) + customer search are
+  pushed down into the mart SQL (dashboard/marts.py build_sql(name,
+  filters) - the 11 marts became small SQL builder functions; the
+  unfiltered form is what the verifier uses). Verified headlessly:
+  removing the 'web' channel drops GMV 15,221,141.27 -> 6,889,883.44;
+  search 'C-000001' returns exactly that customer.
+  Trino gotchas found: no ILIKE (use lower(...) LIKE lower pattern via
+  python-side .lower()), month is DATE (needs DATE '...' literals), and
+  order channels (mobile/pos/web) vs customer acquisition channels
+  (direct/email/organic_search/...) are different dimensions - filtered
+  separately.
+- Re-seeding: `make reseed SEED=<n>` = delete data/synthetic +
+  generate_synthetic.py --seed <n> + make refresh + make verify.
+  verify_dashboard.py is seed-aware: row counts come from the manifest,
+  GMV is a cross-layer check (gold revenue_by_channel vs silver
+  fct_orders valid-order sum) instead of a hardcoded seed-42 value.
+  Tested: seed 123 -> GMV $18,101,425.63 / AOV $373.56 (vs $15.2M /
+  $313.38 for seed 42); `make reseed SEED=42` restores bit-identical data.
 - Why not Superset (see v1 notes below for the deep dive): API-created
   charts cannot be rendered by the 4.1 frontend - the dashboard grid
   rebuilds each chart's query from `form_data` and looks the viz up in a

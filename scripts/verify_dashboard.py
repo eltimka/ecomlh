@@ -3,8 +3,10 @@
 
 Checks (run: .venv/bin/python scripts/verify_dashboard.py):
   1. every mart in dashboard/marts.py executes on Trino and returns rows
-  2. deterministic data invariants hold (seed 42):
-       customers = 5,000, orders = 50,000, GMV = 15,221,141.27
+  2. data invariants - seed-aware (expected counts come from
+     data/synthetic/manifest.json, so any DATA_SEED verifies):
+       customers / orders = generator row counts
+       GMV: gold.revenue_by_channel == silver.fct_orders (cross-layer)
        12 trend months, 3 channels, 8 categories
   3. the Streamlit app is serving (health endpoint -> 200); a throwaway
      headless instance is started and stopped automatically if the
@@ -15,6 +17,7 @@ Exit code 0 + "RESULT: PASS" when everything is green.
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -29,7 +32,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(REPO_ROOT / ".env")
 
 sys.path.insert(0, str(REPO_ROOT / "dashboard"))
-from marts import MARTS  # noqa: E402
+from marts import MARTS, build_sql  # noqa: E402
 
 TRINO_HOST = os.environ.get("TRINO_HOST", "localhost")
 TRINO_PORT = int(os.environ.get("TRINO_PORT", "8080"))
@@ -37,11 +40,17 @@ TRINO_USER = os.environ.get("TRINO_USER", "admin")
 
 DASHBOARD_PORT = int(os.environ.get("STREAMLIT_PORT", "8501"))
 HEALTH_URL = f"http://localhost:{DASHBOARD_PORT}/_stcore/health"
+MANIFEST = REPO_ROOT / "data" / "synthetic" / "manifest.json"
 
 
 def main() -> int:
     failures: list[str] = []
-    print("Streamlit dashboard verification")
+    manifest = json.loads(MANIFEST.read_text())
+    seed = manifest["seed"]
+    n_customers = manifest["tables"]["customers"]["rows"]
+    n_orders = manifest["tables"]["orders"]["rows"]
+
+    print(f"Streamlit dashboard verification (dataset seed: {seed})")
     print("=" * 60)
 
     def check(name: str, ok: bool, detail: str = "") -> None:
@@ -54,9 +63,15 @@ def main() -> int:
     try:
         results: dict[str, list[tuple]] = {}
         cur = con.cursor()
-        for name, sql in MARTS.items():
-            cur.execute(sql)
+        for name in MARTS:
+            cur.execute(build_sql(name))
             results[name] = cur.fetchall()
+        # cross-layer GMV reference (seed-independent): valid orders in silver
+        cur.execute(
+            "SELECT COALESCE(SUM(total_amount) FILTER (WHERE is_cancelled = false), 0) "
+            "FROM iceberg.silver.fct_orders"
+        )
+        silver_gmv = float(cur.fetchone()[0])
         print(f"  ok    queried all {len(MARTS)} marts on {TRINO_HOST}:{TRINO_PORT}")
         check(f"all {len(MARTS)} marts execute and return rows",
               all(len(rows) > 0 for rows in results.values()))
@@ -73,9 +88,12 @@ def main() -> int:
     gmv = float(results["kpi_gmv"][0][0])
     aov = float(results["kpi_aov"][0][0])
 
-    check("KPI customers = 5,000 (deterministic seed 42)", customers == 5000, f"got {customers:,}")
-    check("KPI orders = 50,000", orders == 50_000, f"got {orders:,}")
-    check("KPI GMV = 15,221,141.27", abs(gmv - 15_221_141.27) < 0.01, f"got {gmv:,.2f}")
+    check(f"KPI customers = manifest count", customers == n_customers,
+          f"got {customers:,}, expected {n_customers:,}")
+    check(f"KPI orders = manifest count", orders == n_orders,
+          f"got {orders:,}, expected {n_orders:,}")
+    check("KPI GMV = silver valid-order revenue (cross-layer)",
+          abs(gmv - silver_gmv) < 0.01, f"gold {gmv:,.2f} vs silver {silver_gmv:,.2f}")
     check("KPI AOV in (0, 10,000)", 0 < aov < 10_000, f"got {aov:,.2f}")
     check("revenue trend has 12 months (Jan-Dec 2024)", len(results["revenue_trend"]) == 12,
           f"got {len(results['revenue_trend'])}")
