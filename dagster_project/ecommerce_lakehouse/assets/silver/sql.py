@@ -374,24 +374,48 @@ SILVER_SPECS: list[dict] = [
     {
         "name": "fct_web_events",
         "table": "iceberg.silver.fct_web_events",
-        "deps": ["web_events"],
+        "deps": ["web_events", "stream_web_events"],
         "description": (
-            "Web-event fact: standardized enums, anonymous sessions kept and "
-            "flagged (customer_id stays null by design)."
+            "Web-event fact: batch + stream sources UNIONed and deduped on "
+            "event_id (on a duplicate the batch row wins - both sources "
+            "carry the identical payload per event_id and there is no "
+            "arrival timestamp, so the source rank exists only to make the "
+            "dedup deterministic). Standardized enums, anonymous sessions "
+            "kept and flagged (customer_id stays null by design)."
         ),
         "ctas": """
             CREATE TABLE iceberg.silver.fct_web_events {location_props} AS
-            SELECT e.event_id,
-                   e.customer_id,
-                   lower(trim(e.event_type))     AS event_type,
-                   trim(e.category)              AS category,
-                   lower(trim(e.device))         AS device,
-                   e.event_date,
-                   e.customer_id IS NULL         AS is_anonymous
-            FROM iceberg.bronze.web_events e
+            SELECT r.event_id,
+                   r.customer_id,
+                   r.event_type,
+                   r.category,
+                   r.device,
+                   r.event_date,
+                   r.customer_id IS NULL         AS is_anonymous
+            FROM (
+                SELECT event_id,
+                       customer_id,
+                       lower(trim(event_type))   AS event_type,
+                       trim(category)             AS category,
+                       lower(trim(device))       AS device,
+                       event_date,
+                       row_number() OVER (PARTITION BY event_id
+                                          ORDER BY src_rank) AS rn
+                FROM (
+                    SELECT event_id, customer_id, event_type, category,
+                           device, event_date, 1 AS src_rank
+                    FROM iceberg.bronze.web_events
+                    UNION ALL
+                    SELECT event_id, customer_id, event_type, category,
+                           device, event_date, 2 AS src_rank
+                    FROM iceberg.bronze.stream_web_events
+                ) sources
+            ) r
+            WHERE r.rn = 1
         """,
         "pre_stats": [
             ("bronze_rows", "SELECT count(*) FROM iceberg.bronze.web_events"),
+            ("stream_rows", "SELECT count(*) FROM iceberg.bronze.stream_web_events"),
             (
                 "anonymous_rows",
                 "SELECT count(*) FROM iceberg.bronze.web_events "
@@ -403,6 +427,12 @@ SILVER_SPECS: list[dict] = [
                 "anonymous_after",
                 "SELECT count(*) FROM iceberg.silver.fct_web_events "
                 "WHERE is_anonymous",
+            ),
+            (
+                "duplicates_dropped",
+                "SELECT (SELECT count(*) FROM iceberg.bronze.web_events) "
+                "+ (SELECT count(*) FROM iceberg.bronze.stream_web_events) "
+                "- (SELECT count(*) FROM iceberg.silver.fct_web_events)",
             ),
         ],
     },

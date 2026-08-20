@@ -108,6 +108,45 @@ def main() -> int:
     check("customer sample has 25 rows", len(results["customer_sample"]) == 25,
           f"got {len(results['customer_sample'])}")
 
+    # ------------------------------------------------- 2b. live stream panel
+    from live import (  # noqa: E402  (dashboard/ on sys.path since line 34)
+        flink_job_status,
+        kafka_topic_end_offset,
+        latest_events,
+        stream_counts,
+    )
+
+    print("live stream panel data sources")
+    job = flink_job_status()
+    check("flink stream job is RUNNING",
+          job.get("found") and job.get("state") == "RUNNING",
+          f"state={job.get('state')}" + (f" ({str(job.get('error'))[:80]})" if job.get("error") else ""))
+    # sample the committed count BEFORE the topic end offset: both are
+    # monotonically increasing and committed <= produced, but with a live
+    # producer a stale end-offset sample would break the comparison
+    counts = stream_counts()
+    check("stream source counts readable", counts.get("ok", False),
+          f"batch={counts['batch_rows']:,} stream={counts['stream_rows']:,} merged={counts['merged_rows']:,}"
+          if counts.get("ok") else str(counts.get("error"))[:80])
+    kafka = kafka_topic_end_offset()
+    check("kafka topic end offset readable", kafka.get("ok", False),
+          f"end_offset={kafka.get('end_offset'):,}" if kafka.get("ok") else str(kafka.get("error"))[:80])
+    if counts.get("ok"):
+        check("merged silver >= batch bronze (superset of batch)",
+              counts["merged_rows"] >= counts["batch_rows"],
+              f"merged={counts['merged_rows']:,} batch={counts['batch_rows']:,}")
+        check("merged silver <= batch + stream (dedup bound)",
+              counts["merged_rows"] <= counts["batch_rows"] + counts["stream_rows"],
+              f"merged={counts['merged_rows']:,} in={counts['batch_rows'] + counts['stream_rows']:,}")
+        if kafka.get("ok"):
+            check("committed stream rows <= topic end offset",
+                  counts["stream_rows"] <= kafka["end_offset"],
+                  f"committed={counts['stream_rows']:,} end_offset={kafka['end_offset']:,}")
+        latest = latest_events()
+        check("latest events query returns rows with unique event_ids",
+              len(latest) > 0 and latest["event_id"].is_unique,
+              f"{len(latest)} rows")
+
     # ------------------------------------------------------------------ 3.
     proc = None
     try:

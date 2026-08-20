@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Dependency resolver for the Flink image (flink/Dockerfile).
+
+  `mvn dependency:copy-dependencies` (run in the Dockerfile build) copies the
+  full transitive closure of:
+    - org.apache.iceberg:iceberg-flink-1.20 (catalog + Iceberg v2 sink, Hive
+      catalog, parquet/orc data handling)
+    - org.apache.flink:flink-sql-connector-kafka (fat Kafka SQL connector)
+  into /opt/flink/lib/ of the Flink distribution.
+
+  Flink itself and slf4j are provided by the Flink distribution (the
+  connector's pom marks them <scope>provided</scope>), so they are not
+  duplicated.
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <groupId>local</groupId>
+  <artifactId>flink-iceberg-deps</artifactId>
+  <version>1.0</version>
+  <packaging>pom</packaging>
+
+  <dependencies>
+    <dependency>
+      <groupId>org.apache.iceberg</groupId>
+      <artifactId>iceberg-flink-1.20</artifactId>
+      <version>1.9.1</version>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.flink</groupId>
+      <artifactId>flink-sql-connector-kafka</artifactId>
+      <version>3.4.0-1.20</version>
+    </dependency>
+    <!--
+      Iceberg's Flink sink (IcebergStreamWriterMetrics) references the
+      com.codahale.metrics 4.x API but declares no dependency on it - it
+      expects the Flink runtime to provide it, and the 1.20.3 flink-dist jar
+      ships only a zookeeper-shaded copy. metrics-core 4.x keeps the
+      com.codahale.metrics package (5.x renames it to io.dropwizard.metrics5).
+    -->
+    <!-- Flink's dropwizard metric wrapper (optional module, absent from the
+         base image): Iceberg's Flink sink bridges Flink metric groups to
+         dropwizard histograms/meters via these classes. -->
+    <dependency>
+      <groupId>org.apache.flink</groupId>
+      <artifactId>flink-metrics-dropwizard</artifactId>
+      <version>1.20.3</version>
+    </dependency>
+    <dependency>
+      <groupId>io.dropwizard.metrics</groupId>
+      <artifactId>metrics-core</artifactId>
+      <version>4.2.30</version>
+    </dependency>
+    <!--
+      The Iceberg closure pulls slf4j-api 2.0.x, which ignores the Flink
+      image's 1.7-style log4j2 binding (=> all logs go to a NOP logger).
+      Pin the version Flink 1.20 itself uses so logging reaches log4j2.
+    -->
+    <dependency>
+      <groupId>org.slf4j</groupId>
+      <artifactId>slf4j-api</artifactId>
+      <version>1.7.36</version>
+    </dependency>
+  </dependencies>
+</project>

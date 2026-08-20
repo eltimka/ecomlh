@@ -3,7 +3,10 @@
 
 Checks (stack up, bronze + silver materialized):
   1. All 9 silver tables exist (3 dimensions + 6 facts).
-  2. Row-count conformance vs bronze (dedup/filter effects explained).
+  2. Row-count conformance vs bronze (dedup/filter effects explained;
+     fct_web_events = distinct event_ids across batch + stream bronze,
+     duplicates deduped; with a live producer running the check is
+     bound-checked, since the fact was materialized at the last refresh).
   3. Quality assertions that must hold (violations counted, expect 0):
      email uniqueness, enum normalization, payment consistency,
      line-total arithmetic, refund lag >= 0, linked-ticket validity.
@@ -16,6 +19,7 @@ Exit code 0 + "RESULT: PASS" when everything is green.
 from __future__ import annotations
 
 import sys
+import time
 
 from trino.dbapi import connect
 
@@ -75,8 +79,34 @@ def main() -> int:
         "payments": scalar("SELECT count(*) FROM iceberg.bronze.payments"),
         "refunds": scalar("SELECT count(*) FROM iceberg.bronze.refunds"),
         "web_events": scalar("SELECT count(*) FROM iceberg.bronze.web_events"),
+        "web_events_stream": scalar(
+            "SELECT count(*) FROM iceberg.bronze.stream_web_events"),
         "support_tickets": scalar("SELECT count(*) FROM iceberg.bronze.support_tickets"),
     }
+    # Phase 13: fct_web_events merges batch + stream and dedups on event_id
+    web_events_union = scalar(
+        "SELECT count(DISTINCT event_id) FROM ("
+        "SELECT event_id FROM iceberg.bronze.web_events "
+        "UNION ALL "
+        "SELECT event_id FROM iceberg.bronze.stream_web_events) u"
+    )
+    # Phase 14: detect a running live producer (stream growing) - the merged
+    # fact was materialized at the last refresh, which can predate live rows
+    # committed meanwhile, so strict equality is relaxed to a bound check.
+    time.sleep(3)
+    stream_sample_2 = scalar("SELECT count(*) FROM iceberg.bronze.stream_web_events")
+    live_stream = stream_sample_2 != bronze["web_events_stream"]
+    if live_stream:
+        web_events_union = scalar(
+            "SELECT count(DISTINCT event_id) FROM ("
+            "SELECT event_id FROM iceberg.bronze.web_events "
+            "UNION ALL "
+            "SELECT event_id FROM iceberg.bronze.stream_web_events) u"
+        )
+    web_events_dups = (
+        bronze["web_events"] + (stream_sample_2 if live_stream else bronze["web_events_stream"])
+        - web_events_union
+    )
     drops = {
         "dup_customers": bronze["customers"]
         - scalar("SELECT count(DISTINCT lower(email)) FROM iceberg.bronze.customers"),
@@ -110,13 +140,23 @@ def main() -> int:
         "fct_order_items": bronze["order_items"] - drops["orphan_items"],
         "fct_payments": bronze["payments"] - drops["dup_payments"] - drops["orphan_payments"],
         "fct_refunds": bronze["refunds"] - drops["orphan_refunds"],
-        "fct_web_events": bronze["web_events"],
+        "fct_web_events": web_events_union,
         "fct_support_tickets": bronze["support_tickets"],
     }
     for table, exp in expected.items():
-        check(f"rows: {table} = bronze - drops",
-              counts[table] == exp,
-              f"{counts[table]:,} vs expected {exp:,}")
+        detail = f"{counts[table]:,} vs expected {exp:,}"
+        ok = counts[table] == exp
+        if table == "fct_web_events":
+            if live_stream:
+                ok = bronze["web_events"] <= counts[table] <= exp
+                detail += (f" (live stream active: bound-checked between batch "
+                           f"distinct {bronze['web_events']:,} and current union {exp:,})")
+            else:
+                detail += f" (distinct event_ids across batch + stream; {web_events_dups:,} duplicates deduped)"
+        check(f"rows: {table} = bronze - drops", ok, detail)
+    check("rows: fct_web_events is a superset of the batch source",
+          counts["fct_web_events"] >= bronze["web_events"],
+          f"{counts['fct_web_events']:,} vs batch {bronze['web_events']:,}")
     expected_days = scalar(
         "SELECT date_diff('day', (SELECT min(order_date) FROM iceberg.bronze.orders), "
         "(SELECT max(order_date) FROM iceberg.bronze.orders)) + 1"
@@ -125,6 +165,11 @@ def main() -> int:
           counts["dim_order_dates"] == expected_days,
           f"{counts['dim_order_dates']:,} vs {expected_days:,}")
     print(f"        info: documented drops: {drops}")
+    stream_now = stream_sample_2 if live_stream else bronze["web_events_stream"]
+    print(f"        info: web_events merge: batch {bronze['web_events']:,} + "
+          f"stream {stream_now:,} -> "
+          f"{web_events_union:,} distinct ({web_events_dups:,} deduped)"
+          + (" [live producer running]" if live_stream else ""))
 
     # 3. Quality assertions (all must be zero)
     zero_checks = [

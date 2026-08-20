@@ -3,10 +3,13 @@
 A production-style **Customer 360 data pipeline** that runs entirely on your
 laptop. Synthetic e-commerce data flows through a **Medallion lakehouse**
 (Bronze → Silver → Gold) on **Apache Iceberg** in **MinIO**, orchestrated by
-**Dagster** (with 85 declarative data-quality checks), queried by **Trino**,
+**Dagster** (with 92 declarative data-quality checks), queried by **Trino**,
 and visualized in a local **Streamlit** dashboard.
 
 100% local and open-source — no AWS, no GCP, no Snowflake.
+
+> **How the data flows, end to end (batch + streaming, step by step):
+> [DATA_FLOW.md](./DATA_FLOW.md).**
 
 ## What this project demonstrates
 
@@ -15,7 +18,7 @@ and visualized in a local **Streamlit** dashboard.
   tables with ACID commits and time travel
 - **Software-defined assets** — every table is a Dagster asset with lineage;
   all transformations are versioned Trino SQL (spec-driven, declarative)
-- **Data quality as code** — 85 asset checks (uniqueness, referential
+- **Data quality as code** — 92 asset checks (uniqueness, referential
   integrity, freshness, business rules, invariants, anomaly detection),
   blocking where it matters, running inside the refresh jobs
 - **End-to-end verification** — one script per layer, each prints
@@ -25,8 +28,13 @@ and visualized in a local **Streamlit** dashboard.
   (`dashboard/marts.py` + `dashboard/app.py`): every chart is a versioned
   Trino query with push-down filters, no manual configuration, no extra
   service
-- **Re-seedable data** — `make reseed SEED=<n>` regenerates the dataset and
-  re-runs the whole pipeline; seed 42 is bit-reproducible end to end
+- **Streaming path** — web events flow Kafka → Flink → Iceberg
+  (`bronze.stream_web_events`) as a real-time append that coexists with the
+  batch pipeline on the same catalog; replay is bit-identical to batch, live
+  mode uses a simulated clock
+- **Re-seedable data** — `make reseed SEED=<n>` regenerates the dataset,
+  resets the stream path (job + table + topic) and re-runs the whole
+  pipeline; seed 42 is bit-reproducible end to end
 - **Reproducibility** — deterministic synthetic data (seeded, per-entity RNG
   streams, Zipf skew, seasonality, realistic refund/churn behavior)
 
@@ -35,7 +43,7 @@ and visualized in a local **Streamlit** dashboard.
 ```
                         ┌────────────────────────────┐
    data_generator/      │         Dagster            │
-   (seeded Parquet) ───▶ │  24 assets + 85 checks     │
+   (seeded Parquet) ───▶ │  25 assets + 92 checks     │
                         │  jobs: bronze/silver/gold/ │
                         │  lakehouse_refresh         │
                         └─────────────┬──────────────┘
@@ -55,6 +63,9 @@ and visualized in a local **Streamlit** dashboard.
         ┌─────────────────────────────────────────────┐
         │  Hive Metastore (Thrift) ← Postgres store   │
         └─────────────────────────────────────────────┘
+
+  Streaming:  data_generator (replay/live) ──▶ Kafka (raw.web_events)
+             ──▶ Flink ──▶ Iceberg bronze.stream_web_events (same catalog)
 
   Gold marts ──▶ Trino ──▶ Streamlit (port 8501)
                      "Customer 360" dashboard (live Trino queries):
@@ -80,6 +91,8 @@ and visualized in a local **Streamlit** dashboard.
 | Query engine       | Trino 483                      |
 | Transformations    | Trino SQL (versioned, spec-driven) |
 | Synthetic data     | Python + NumPy + Polars/Parquet |
+| Streaming bus      | Apache Kafka (KRaft, single node) |
+| Stream processing  | Apache Flink 1.20 + Iceberg Flink connector |
 | Dashboard          | Streamlit + Plotly (local venv, live Trino queries) |
 | Infrastructure     | Docker Compose                 |
 
@@ -96,7 +109,8 @@ Elvira_Project/
 │       ├── definitions.py     # assets, checks, 4 refresh jobs
 │       ├── assets/            # bronze / silver / gold + checks.py + factory
 │       └── resources/         # TrinoResource, MinioResource
-├── data_generator/            # seeded synthetic data generator
+├── data_generator/            # seeded synthetic data generator + Kafka producer
+├── flink/                     # custom Flink image + Kafka → Iceberg stream job
 ├── dashboard/                 # Streamlit dashboard (app.py + marts.py SQL)
 ├── scripts/                   # bootstrap + verification (one per layer)
 ├── data/synthetic/            # generated Parquet (gitignored)
@@ -120,14 +134,16 @@ make run
 ```
 
 `make run` brings up the stack, generates data if missing, bootstraps MinIO,
-starts the dashboard, runs the full `lakehouse_refresh` job
-(24 assets + 85 checks), and finishes with the quick verification suite.
-Then:
+replays the seeded web_events history into the Kafka topic, submits the
+Flink job that appends the topic into Iceberg, starts the dashboard, runs
+the full `lakehouse_refresh` job (25 assets + 92 checks), and finishes with
+the quick verification suite. Then:
 
 | Open                              | What to see                                                    |
 |-----------------------------------|----------------------------------------------------------------|
 | http://localhost:8501               | "Customer 360" dashboard: KPIs, LTV distribution, churn/RFM mixes, revenue trend, channel/category, customer profiles. **Interactive**: order-channel / acquisition-channel / churn-risk / month-range filters + customer search - every change re-queries Trino |
-| `make dev` → http://localhost:3000  | Dagster: asset graph, runs, 85 check results                   |
+| `make dev` → http://localhost:3000  | Dagster: asset graph, runs, 91 check results                   |
+| http://localhost:8081               | Flink: stream job RUNNING, clean checkpoints |
 | http://localhost:9001 (minioadmin/minioadmin) | bronze/silver/gold buckets with Iceberg metadata/data |
 
 ### Manual steps (what `make run` does)
@@ -136,9 +152,11 @@ Then:
 cd docker && docker compose up -d && cd ..
 .venv/bin/python data_generator/generate_synthetic.py   # if data/ missing
 .venv/bin/python scripts/bootstrap_minio.py              # buckets + schemas
+.venv/bin/python data_generator/stream_producer.py --mode replay --if-empty
+make flink-up                                             # Kafka → Iceberg stream job
 cd dagster_project
 ../.venv/bin/dagster job execute -m ecommerce_lakehouse.definitions -j lakehouse_refresh
-cd ..   # bronze→silver→gold + 85 checks
+cd ..   # bronze→silver→gold + 92 checks
 .venv/bin/streamlit run dashboard/app.py              # dashboard on :8501
 .venv/bin/python scripts/verify_dashboard.py           # RESULT: PASS
 ```
@@ -155,7 +173,10 @@ cd ..   # bronze→silver→gold + 85 checks
 | `make dashboard`  | Streamlit Customer 360 dashboard on :8501 (foreground)         |
 | `make verify`     | quick verification suite (all layers + dashboard)              |
 | `make verify-dq`  | heavy DQ suite: check-unit tests + failure-path test + full re-run |
-| `make reseed SEED=<n>` | regenerate synthetic data with a new seed, re-run the full pipeline + verification (42 = canonical dataset) |
+| `make flink-up` / `flink-down` | submit / cancel the Kafka → Iceberg stream job (idempotent) |
+| `make stream-up` / `stream-down` | live event producer: replays history, then emits new events on a simulated clock |
+| `make maintain` | Iceberg upkeep: expire old snapshots + remove orphan files (stream snapshots grow per Flink checkpoint) |
+| `make reseed SEED=<n>` | regenerate synthetic data with a new seed, reset the stream path (job + table + topic) and re-run the full pipeline + verification (42 = canonical dataset) |
 | `make logs`       | tail all service logs                                          |
 | `make clean`      | stack down **+ volume deletion** + generated data (full reset) |
 
@@ -170,7 +191,7 @@ it does not mutate.
 To see the whole pipeline react to *new* data:
 
 ```bash
-make reseed SEED=123     # regenerate + full pipeline (all 85 checks) + verify
+make reseed SEED=123     # regenerate + full pipeline (all 92 checks) + verify
 # open http://localhost:8501 - every KPI, mix and trend now differs
 make reseed SEED=42      # restore the canonical dataset (bit-identical)
 ```
@@ -233,16 +254,60 @@ Each layer has a persistent verification script; all print `RESULT: PASS`:
    November/December seasonal bump in the revenue trend, the Zipf-skewed LTV
    distribution, churn/RFM mixes, and a few customer profiles.
 3. Open **Dagster** → show the asset graph (bronze → silver → gold) and a
-   finished run with **85/85 checks green**; point at a blocking check.
+   finished run with **92/92 checks green**; point at a blocking check.
 4. `docker exec trino trino --execute "SELECT ... FOR SYSTEM_TIME AS OF
    ..."` or `SELECT * FROM gold.customer_360` — Iceberg time travel.
-5. Run `make verify` — five `RESULT: PASS` lines, ending on the dashboard.
+5. Run `make verify` — seven `RESULT: PASS` lines, ending on the dashboard.
+6. (Streaming) Open **Flink** (http://localhost:8081): the stream job is
+   RUNNING with clean checkpoints; `SELECT count(*) FROM
+   iceberg.bronze.stream_web_events` in Trino matches the Kafka topic.
+7. (Live) In the dashboard, switch the sidebar to **Live stream**: Flink
+   job state + checkpoints, committed rows vs Kafka end offset ("caught
+   up"), batch/stream/merged row counts, measured event rate, latest
+   events — auto-refreshes every 15s. Then `make stream-up` and watch the
+   committed rows tick up as new events arrive (~10s checkpoint delay);
+   `make stream-down` when done.
+
+## Roadmap
+
+A streaming path for **web events** (Phases 11–15 in [PROJECT.md](./PROJECT.md)):
+seeded event producer → Kafka → Flink → `bronze.stream_web_events` (Iceberg
+append), merged into silver with the batch data (dedup on `event_id`), plus a
+"Live" panel on the dashboard. Same determinism story: replay mode is
+bit-identical to the batch dataset (zero delta after dedup); live mode uses a
+simulated clock. Full Flink cluster (decided over Trino micro-batch);
+streaming orders/payments is Phase 15 backlog.
+
+**Status:** Phases 11–14 done — Kafka (KRaft) runs in the compose stack,
+`make run` replays the seeded web_events history into the `raw.web_events`
+topic (verified bit-identical by `scripts/verify_kafka.py`), submits the
+Flink job that appends the topic into `iceberg.bronze.stream_web_events`
+(Iceberg v2, Hive catalog, S3A/MinIO; verified by
+`scripts/verify_stream.py`), and the silver layer merges both sources into
+`fct_web_events` with event_id dedup (replay is a zero-delta no-op; live
+events extend the facts and the gold marts). The dashboard has a "Live
+stream" view (sidebar toggle, 15s auto-refresh) showing the Flink job,
+committed rows vs Kafka end offset, event rate and latest events.
+`make reseed` resets the whole stream path (job, table, topic) before
+regenerating. Live demo: `make stream-up` / `make stream-down` (safe to run
+on a seeded topic - it skips the history preamble); job control:
+`make flink-up` / `make flink-down`. Flink restarts are durable: the job
+resumes from committed consumer-group offsets with checkpoints on S3
+(`flink-state` bucket), so a stop/start never re-appends the history.
+Phase 15 hardening is done: a non-blocking `consumer_lag` Dagster check
+watches committed rows vs the Kafka end offset, and `make maintain` keeps
+the stream table's snapshot count (one per Flink checkpoint) and any orphan
+files under control. The money-path backlog (streaming orders + payments)
+remains in the PROJECT.md backlog for a future phase.
 
 ## Build history
 
 Built and documented phase by phase in [PROJECT.md](./PROJECT.md)
-(Phases 0–10: scaffold → infrastructure → Dagster → synthetic data →
-bronze → silver → gold → data quality → Streamlit dashboard → polish).
+(Phases 0–15: scaffold → infrastructure → Dagster → synthetic data →
+bronze → silver → gold → data quality → Streamlit dashboard → polish →
+Kafka streaming bus → Flink → Iceberg stream bronze → silver merge + DQ →
+live dashboard + ops → hardening: durable Flink restarts, consumer-lag
+check, Iceberg maintenance).
 
 ## License
 

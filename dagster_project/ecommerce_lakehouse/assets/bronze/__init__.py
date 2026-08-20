@@ -145,10 +145,78 @@ def _bronze_asset(table: str):
     return bronze_asset
 
 
-bronze_assets = [_bronze_asset(table) for table in BRONZE_TABLES]
+bronze_assets: list = [_bronze_asset(table) for table in BRONZE_TABLES]
+
+
+def _stream_web_events_asset():
+    """Virtual asset for ``iceberg.bronze.stream_web_events`` (Phase 13).
+
+    That Iceberg table is written by the Flink job (Phase 12), not by
+    Dagster. This asset therefore does not write anything - its op observes
+    the table through Trino (existence, row count, event-date range) and
+    reports it as run metadata, so the stream source shows up in the asset
+    graph and silver's merge has a real upstream to depend on. If the table
+    does not exist yet the op fails with the actionable fix (``make
+    flink-up``), because the silver merge reads it unconditionally.
+    """
+
+    @dg.asset(
+        key_prefix=("bronze",),
+        name="stream_web_events",
+        description=(
+            "Virtual observer for bronze.stream_web_events: the table is "
+            "written by the Flink job (append-only), this op only queries "
+            "its state through Trino. Fails until the stream job has "
+            "created the table (make flink-up)."
+        ),
+    )
+    def stream_web_events_asset(
+        context: AssetExecutionContext, trino: TrinoResource
+    ) -> None:
+        (exists,) = trino.fetch(
+            "SELECT count(*) FROM iceberg.information_schema.tables "
+            "WHERE table_catalog = 'iceberg' AND table_schema = 'bronze' "
+            "AND table_name = 'stream_web_events'"
+        )[0]
+        if not int(exists):
+            raise dg.Failure(
+                "iceberg.bronze.stream_web_events does not exist - the Flink "
+                "stream job has never run. Submit it with `make flink-up` "
+                "(it creates the table and ingests the topic)."
+            )
+        (rows,) = trino.fetch("SELECT count(*) FROM iceberg.bronze.stream_web_events")[0]
+        meta: dict[str, int | str] = {
+            "table": "iceberg.bronze.stream_web_events",
+            "rows": int(rows),
+            "written_by": "flink (make flink-up)",
+        }
+        if int(rows) > 0:
+            (mn, mx) = trino.fetch(
+                "SELECT min(event_date), max(event_date) "
+                "FROM iceberg.bronze.stream_web_events"
+            )[0]
+            (distinct,) = trino.fetch(
+                "SELECT count(DISTINCT event_id) FROM iceberg.bronze.stream_web_events"
+            )[0]
+            meta["min_event_date"] = str(mn)
+            meta["max_event_date"] = str(mx)
+            meta["distinct_event_id"] = int(distinct)
+        else:
+            meta["note"] = "0 rows committed yet (first checkpoint pending)"
+        context.add_output_metadata(meta)
+        context.log.info(f"bronze.stream_web_events (virtual): {meta}")
+
+    return stream_web_events_asset
+
 
 #: table name -> asset definition, for wiring downstream `deps=[...]` (lineage)
 BRONZE_ASSETS_BY_NAME = {a.key.path[-1]: a for a in bronze_assets}
+
+# The virtual stream asset joins the layer (before the gate, so the gate
+# waits for it too) and silver's fct_web_events depends on it for lineage.
+_stream_web_events = _stream_web_events_asset()
+bronze_assets.append(_stream_web_events)
+BRONZE_ASSETS_BY_NAME["stream_web_events"] = _stream_web_events
 
 # Barrier asset for cross-table checks (referential integrity between
 # bronze tables runs only after every bronze table is committed).

@@ -26,6 +26,9 @@ plotly>=6.0
 boto3>=1.34
 minio>=7.2
 
+# --- Kafka (streaming producer + verification, Phase 11+) ---
+kafka-python>=2.0.2
+
 # --- Utilities ---
 python-dotenv>=1.0
 requests>=2.31

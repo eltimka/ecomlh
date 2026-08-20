@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<?xml-stylesheet type="text/xsl" href="configuration.xsl"?>
+<!--
+  Hadoop S3A configuration for Iceberg's HadoopFileIO (Phase 12).
+
+  Picked up via the classpath: the Flink launch scripts put /opt/flink/conf
+  (where this file is mounted) on the classpath, and Hadoop's default
+  Configuration() scans the classpath for core-site.xml.
+
+  NOTE: the endpoint is `minio:9000` (the Compose service name) - this file
+  is only used INSIDE the Flink containers. Host-side tooling (Trino,
+  scripts) has its own S3 configuration.
+-->
+<configuration>
+  <!-- Explicit http:// scheme: S3A defaults to HTTPS for scheme-less
+       endpoints, but MinIO serves plain HTTP on 9000 (a TLS handshake to
+       the HTTP port yields "400 Bad Request" and an infinite retry loop). -->
+  <property>
+    <name>fs.s3a.endpoint</name>
+    <value>http://minio:9000</value>
+  </property>
+  <property>
+    <name>fs.s3a.path.style.access</name>
+    <value>true</value>
+  </property>
+  <property>
+    <name>fs.s3a.access.key</name>
+    <value>minioadmin</value>
+  </property>
+  <property>
+    <name>fs.s3a.secret.key</name>
+    <value>minioadmin</value>
+  </property>
+  <property>
+    <name>fs.s3a.connection.establish.timeout</name>
+    <value>30000</value>
+  </property>
+  <property>
+    <name>fs.s3a.connection.socket.timeout</name>
+    <value>30000</value>
+  </property>
+</configuration>

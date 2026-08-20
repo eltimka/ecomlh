@@ -15,14 +15,30 @@
 # Every ${VAR} has a local default, so the stack works out of the box.
 # To override, put values in the repo-root .env file (see .env.example).
 #
-# Startup order:
+#   Startup order:
 #   postgres -> hive-jdbc-init -> hive-aws-init -> hive (metastore) -> trino
 #   minio starts independently (ready in ~2s).
-# First start takes a few minutes: the Hive Metastore initializes its
-# Postgres schema on first boot.
+#   kafka starts independently; kafka-init (one-shot) creates the topics.
+#   flink (jobmanager + taskmanager) starts after kafka + hive are healthy;
+#   the stream JOB itself is submitted separately (make flink-up / flink-down).
+#   First start takes a few minutes: the Hive Metastore initializes its
+#   Postgres schema on first boot.
+#
+#   Kafka listeners:
+#     PLAINTEXT  -> localhost:9092   (clients on the HOST: producer, scripts)
+#     INTERNAL   -> kafka:9094       (clients in CONTAINERS: Flink, Phase 12+)
+#     CONTROLLER -> :9093            (KRaft quorum, internal only)
 # =============================================================================
 
 name: ecommerce-lakehouse
+
+# The default network is renamed so that container canonical hostnames
+# (<container>.<network>) contain no underscores. The Hive 3.x metastore
+# client used by Flink resolves the HMS host to its canonical name and parses
+# it as a java.net.URI, which rejects underscores (URISyntaxException).
+networks:
+  default:
+    name: lakehouse-net
 
 services:
   # ---------------------------------------------------------------------------
@@ -186,7 +202,130 @@ services:
       start_period: 30s
     restart: unless-stopped
 
+  # ---------------------------------------------------------------------------
+  # Kafka - streaming bus (KRaft single node, no ZooKeeper).
+  # Phase 11: topic raw.web_events feeds the streaming producer
+  # (data_generator/stream_producer.py); Phase 12 consumes it via Flink.
+  # ---------------------------------------------------------------------------
+  kafka:
+    image: apache/kafka:3.7.2
+    container_name: kafka
+    environment:
+      KAFKA_NODE_ID: "1"
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,INTERNAL://0.0.0.0:9094,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092,INTERNAL://kafka:9094
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,INTERNAL:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      KAFKA_HEAP_OPTS: "-Xms256M -Xmx512M"
+    ports:
+      - "9092:9092" # host clients (producer, verify scripts)
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      # /opt/kafka/bin is not on the image's default PATH
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 30s
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # One-shot init: create the streaming topics (idempotent, --if-not-exists).
+  # Uses the INTERNAL listener (kafka:9094): the advertised address of the
+  # host-facing PLAINTEXT listener (localhost:9092) is not reachable from
+  # inside this container.
+  # ---------------------------------------------------------------------------
+  kafka-init:
+    image: apache/kafka:3.7.2
+    container_name: kafka-init
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        echo "Creating Kafka topics (if not exists)..."
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9094 \
+          --create --topic raw.web_events \
+          --partitions 3 --replication-factor 1 --if-not-exists
+        echo "Kafka topics ready."
+    depends_on:
+      kafka:
+        condition: service_healthy
+    restart: "no"
+
+  # ---------------------------------------------------------------------------
+  # Flink - stream processing (Phase 12): Kafka raw.web_events -> Iceberg
+  # bronze.stream_web_events. Image built from flink/ (Flink 1.20.3 + Iceberg
+  # 1.9.1 runtime + Hadoop S3A for MinIO). Flink UI: http://localhost:8081.
+  # core-site.xml (fs.s3a.*) is mounted on BOTH containers - the Iceberg
+  # writers run on the taskmanager. Job lifecycle: make flink-up / flink-down.
+  # ---------------------------------------------------------------------------
+  flink-jobmanager:
+    build:
+      context: ../flink
+    image: ecommerce-flink:1.20.3
+    container_name: flink-jobmanager
+    command: jobmanager
+    environment:
+      # Puts /opt/flink/conf (with the mounted core-site.xml) on the classpath
+      # so Hadoop's Configuration() picks up the S3A/MinIO settings.
+      HADOOP_CONF_DIR: /opt/flink/conf
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        jobmanager.memory.process.size: 1600m
+        # Durable checkpoints on S3 (Phase 15): the flink-state bucket is
+        # created by scripts/bootstrap_minio.py. S3A goes through the
+        # flink-s3-fs-hadoop plugin + the mounted core-site.xml.
+        state.checkpoints.dir: s3a://flink-state/checkpoints
+        execution.checkpointing.interval: 10s
+        execution.checkpointing.externalized-checkpoint-retention: RETAIN_ON_CANCELLATION
+    ports:
+      - "8081:8081" # Flink UI
+    volumes:
+      - ../flink/hadoop/core-site.xml:/opt/flink/conf/core-site.xml:ro
+      - ../flink/sql:/opt/flink/sql:ro
+    depends_on:
+      kafka:
+        condition: service_healthy
+      hive:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8081/overview >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 30s
+    restart: unless-stopped
+
+  flink-taskmanager:
+    image: ecommerce-flink:1.20.3
+    container_name: flink-taskmanager
+    command: taskmanager
+    environment:
+      HADOOP_CONF_DIR: /opt/flink/conf
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        taskmanager.numberOfTaskSlots: 2
+        # 4096m (=> ~1.1GB task heap): the Iceberg sink keeps one open
+        # parquet/zstd writer per active partition until a checkpoint, and
+        # the replay spans ~340 distinct event_date partitions - 2048m
+        # (537MB task heap) OOMed before the first checkpoint.
+        taskmanager.memory.process.size: 4096m
+    volumes:
+      - ../flink/hadoop/core-site.xml:/opt/flink/conf/core-site.xml:ro
+    depends_on:
+      flink-jobmanager:
+        condition: service_healthy
+    restart: unless-stopped
+
 volumes:
   minio-data:
   postgres-data:
   hive-auxjars:
+  kafka-data:

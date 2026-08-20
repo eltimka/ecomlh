@@ -26,11 +26,12 @@ load_dotenv(REPO_ROOT / ".env")
 
 
 def get_bucket_names() -> list[str]:
-    """Layer buckets, configurable via .env (one bucket per medallion layer)."""
+    """Layer buckets + Flink state bucket, configurable via .env."""
     return [
         os.environ.get("MINIO_BUCKET_BRONZE", "bronze"),
         os.environ.get("MINIO_BUCKET_SILVER", "silver"),
         os.environ.get("MINIO_BUCKET_GOLD", "gold"),
+        os.environ.get("MINIO_BUCKET_FLINK", "flink-state"),
     ]
 
 

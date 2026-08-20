@@ -7,11 +7,17 @@ Steps (each idempotent - safe to re-run at any time):
   1. docker compose up -d + wait until the stack is healthy
   2. generate synthetic data if data/synthetic/ is missing
   3. bootstrap MinIO buckets + Trino schemas
-  4. start the Streamlit Customer 360 dashboard (port 8501)
-  5. run the lakehouse_refresh Dagster job (bronze -> silver -> gold
-     with all 85 data-quality checks)
-  6. run the quick verification suite
-     (lakehouse, bronze, silver, gold, dashboard)
+  4. replay the web_events history into Kafka (skip if the topic already
+     has messages - keeps re-runs idempotent; `make reseed` resets it)
+  5. submit the Flink stream job (Kafka -> Iceberg bronze.stream_web_events)
+     if it is not already running
+  6. wait until the stream table is caught up with the topic (the silver
+     merge reads it - verify_stream.py, polled)
+  7. start the Streamlit Customer 360 dashboard (port 8501)
+  8. run the lakehouse_refresh Dagster job (bronze -> silver -> gold
+     with all 91 data-quality checks)
+  9. run the quick verification suite
+     (lakehouse, kafka, stream, bronze, silver, gold, dashboard)
 
 The heavy DQ verification (scripts/verify_dq.py - a second full refresh
 run) is left out of the fast path; run `make verify-dq` for it.
@@ -25,6 +31,7 @@ At the end you get:
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -40,7 +47,14 @@ LOGS_DIR = REPO_ROOT / ".logs"
 DASHBOARD_PORT = int(os.environ.get("STREAMLIT_PORT", "8501"))
 
 # long-running services that must be (healthy); one-shot inits may be Exited (0)
-LONG_RUNNING = {"minio", "lakehouse-postgres", "hive-metastore", "trino"}
+LONG_RUNNING = {
+    "minio", "lakehouse-postgres", "hive-metastore", "trino", "kafka",
+    "flink-jobmanager",
+}
+
+# the Flink streaming job (name Flink derives from the INSERT statement)
+STREAM_JOB_NAME = "insert-into_iceberg.bronze.stream_web_events"
+FLINK_REST = "http://localhost:8081"
 
 
 def run(cmd: list[str], cwd: Path | None = None, **kw) -> subprocess.CompletedProcess:
@@ -69,7 +83,7 @@ def stack_status() -> list[tuple[str, str]]:
 
 def step_up() -> None:
     print("=" * 62)
-    print("[1/6] docker compose up + wait for healthy stack")
+    print("[1/8] docker compose up + wait for healthy stack")
     print("=" * 62)
     proc = subprocess.run(COMPOSE + ["up", "-d"], cwd=str(REPO_ROOT))
     if proc.returncode != 0:
@@ -98,7 +112,7 @@ def step_up() -> None:
 
 def step_data() -> None:
     print("=" * 62)
-    print("[2/6] synthetic data")
+    print("[2/8] synthetic data")
     print("=" * 62)
     manifest = REPO_ROOT / "data" / "synthetic" / "manifest.json"
     if manifest.exists():
@@ -111,11 +125,74 @@ def step_data() -> None:
 
 def step_bootstrap() -> None:
     print("=" * 62)
-    print("[3/6] bootstrap MinIO buckets + Trino schemas")
+    print("[3/8] bootstrap MinIO buckets + Trino schemas")
     print("=" * 62)
     proc = run([str(VENV / "python"), "scripts/bootstrap_minio.py"])
     if proc.returncode != 0:
         fail("minio bootstrap failed")
+
+
+def step_stream() -> None:
+    print("=" * 62)
+    print("[4/8] replay web_events history into Kafka (idempotent)")
+    print("=" * 62)
+    proc = run([str(VENV / "python"), "data_generator/stream_producer.py", "--mode", "replay", "--if-empty"])
+    if proc.returncode != 0:
+        fail("kafka replay failed")
+
+
+def flink_stream_job_state() -> str | None:
+    """State of the stream job if it is active (RUNNING/RESTARTING), else None."""
+    try:
+        with urllib.request.urlopen(f"{FLINK_REST}/jobs/overview", timeout=3) as r:
+            jobs = json.load(r)["jobs"]
+    except Exception:
+        return None
+    for j in jobs:
+        if j["name"] == STREAM_JOB_NAME and j["state"] in ("RUNNING", "RESTARTING"):
+            return j["state"]
+    return None
+
+
+def step_flink() -> None:
+    print("=" * 62)
+    print("[5/8] Flink stream job (Kafka -> Iceberg bronze.stream_web_events)")
+    print("=" * 62)
+    state = flink_stream_job_state()
+    if state is not None:
+        print(f"  stream job already {state} - skipping submit")
+        return
+    cmd = COMPOSE + ["exec", "-T", "flink-jobmanager",
+                     "./bin/sql-client.sh", "-f", "/opt/flink/sql/stream_web_events.sql"]
+    proc = run(cmd)
+    if proc.returncode != 0:
+        fail("flink job submission failed")
+    deadline = time.time() + 180
+    seen_running = False
+    while time.time() < deadline:
+        state = flink_stream_job_state()
+        if state == "RUNNING":
+            seen_running = True
+            time.sleep(12)  # give a failing job a moment to restart
+            if flink_stream_job_state() in ("RUNNING", "RESTARTING"):
+                print("  stream job is RUNNING")
+                return
+        if state is None and seen_running:
+            fail("stream job stopped shortly after start (check the Flink UI at :8081)")
+        time.sleep(5)
+    fail("stream job did not reach RUNNING in time")
+
+
+def step_stream_catchup() -> None:
+    print("=" * 62)
+    print("[6/9] wait for the stream table to catch up with the topic")
+    print("=" * 62)
+    # silver.fct_web_events merges bronze.stream_web_events, so the refresh
+    # must only start once the Flink job has committed the topic contents
+    # (Iceberg snapshots land at checkpoints, ~10s after job start).
+    proc = run([str(VENV / "python"), "scripts/verify_stream.py"])
+    if proc.returncode != 0:
+        fail("stream table did not catch up with the Kafka topic")
 
 
 def dashboard_health_ok() -> bool:
@@ -141,7 +218,7 @@ def stop_dashboard() -> None:
 
 def step_dashboard() -> None:
     print("=" * 62)
-    print(f"[4/6] Streamlit Customer 360 dashboard (port {DASHBOARD_PORT})")
+    print(f"[7/9] Streamlit Customer 360 dashboard (port {DASHBOARD_PORT})")
     print("=" * 62)
     if dashboard_health_ok():
         print(f"  already running at http://localhost:{DASHBOARD_PORT} - skipping")
@@ -175,7 +252,7 @@ def step_dashboard() -> None:
 
 def step_refresh() -> None:
     print("=" * 62)
-    print("[5/6] materialize the lakehouse (lakehouse_refresh job, all checks)")
+    print("[8/9] materialize the lakehouse (lakehouse_refresh job, all checks)")
     print("=" * 62)
     proc = run(
         [
@@ -191,10 +268,12 @@ def step_refresh() -> None:
 
 def step_verify() -> None:
     print("=" * 62)
-    print("[6/6] quick verification suite")
+    print("[9/9] quick verification suite")
     print("=" * 62)
     for script in [
         "verify_lakehouse.py",
+        "verify_kafka.py",
+        "verify_stream.py",
         "verify_bronze.py",
         "verify_silver.py",
         "verify_gold.py",
@@ -213,6 +292,9 @@ def main() -> None:
     step_up()
     step_data()
     step_bootstrap()
+    step_stream()
+    step_flink()
+    step_stream_catchup()
     step_dashboard()
     step_refresh()
     step_verify()
@@ -222,6 +304,8 @@ def main() -> None:
     print("  Dagster UI             : .venv/bin/dagster dev  -> http://localhost:3000")
     print("  Trino                  : localhost:8080 (user: admin, catalog: iceberg)")
     print("  MinIO console          : http://localhost:9001 (minioadmin / minioadmin)")
+    print("  Kafka                  : localhost:9092 (topic raw.web_events; live demo: make stream-up)")
+    print("  Flink                  : http://localhost:8081 (stream job -> iceberg.bronze.stream_web_events)")
     print(f"  Full DQ suite          : make verify-dq   (took {time.time() - t0:.0f}s total)")
     print("=" * 62)
 

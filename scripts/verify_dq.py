@@ -3,11 +3,12 @@
 
 Checks:
   1. Condition evaluator unit tests (zero / positive / range_cover /
-     boolean_true / gmv_spread / z_lt_3 / max_month, pass and fail sides).
+     boolean_true / gmv_spread / z_lt_3 / max_month / info, pass and fail
+     sides).
   2. Live negative test: a deliberately failing check is recorded as
      failed (the suite is not vacuously green).
   3. Full ``lakehouse_refresh`` job run in a fresh instance:
-     all 24 assets (21 tables + 3 layer gates) materialize and all 85
+     all 25 assets (22 tables + 3 layer gates) materialize and all 91
      asset checks evaluate to
      passed.
 
@@ -34,8 +35,8 @@ from dagster._core.storage.asset_check_execution_record import (  # noqa: E402
 from ecommerce_lakehouse.assets import checks as checks_mod  # noqa: E402
 from ecommerce_lakehouse.definitions import definitions  # noqa: E402
 
-EXPECTED_ASSETS = 24  # 21 tables + 3 per-layer gate (barrier) assets
-EXPECTED_CHECKS = 85
+EXPECTED_ASSETS = 25  # 22 tables + 3 per-layer gate (barrier) assets
+EXPECTED_CHECKS = 92
 
 
 def main() -> int:
@@ -123,10 +124,54 @@ def main() -> int:
             (date(end.year, 1, 1),),
             False,
         ),
+        (
+            "range_stream: pass (max may exceed end - live events)",
+            {"condition": "range_cover", "range_kind": "stream"},
+            (date(2024, 1, 1), date(2025, 2, 14)),
+            True,
+        ),
+        (
+            "range_stream: fail (stale max, stream not fresh)",
+            {"condition": "range_cover", "range_kind": "stream"},
+            (date(2024, 1, 1), date(2024, 6, 30)),
+            False,
+        ),
+        (
+            "range_stream: fail (empty table)",
+            {"condition": "range_cover", "range_kind": "stream"},
+            (None, None),
+            False,
+        ),
+        (
+            "info: pass (informational count, any value)",
+            {"condition": "info"},
+            (4999,),
+            True,
+        ),
     ]
     for name, spec, row, expected in cases:
         passed, _ = ev(spec, row)
         check(name, passed is expected)
+
+    # kafka_lag: patch the Kafka accessor so these cases stay pure
+    _lag_spec = {"condition": "kafka_lag", "topic": "raw.web_events", "lag_tolerance": 1000}
+    real_end_offset = checks_mod._kafka_end_offset
+    try:
+        checks_mod._kafka_end_offset = lambda topic: 50_000
+        lag_cases = [
+            ("kafka_lag: pass (caught up)", (50000,), True),
+            ("kafka_lag: pass (small checkpoint lag)", (49800,), True),
+            ("kafka_lag: fail (consumer behind)", (48000,), False),
+            ("kafka_lag: fail (over-appended table)", (52000,), False),
+        ]
+        for name, row, expected in lag_cases:
+            passed, _ = ev(dict(_lag_spec), row)
+            check(name, passed is expected)
+        checks_mod._kafka_end_offset = lambda topic: None
+        passed, _ = ev(dict(_lag_spec), (50000,))
+        check("kafka_lag: fail (kafka unreachable)", passed is False)
+    finally:
+        checks_mod._kafka_end_offset = real_end_offset
 
     # ------------------------------------------------------------------ 2.
     print("[2] Live negative test (deliberately failing check)")
@@ -181,7 +226,7 @@ def main() -> int:
     )
 
     # ------------------------------------------------------------------ 3.
-    print("[3] Full lakehouse_refresh run (24 assets + all asset checks)")
+    print("[3] Full lakehouse_refresh run (25 assets + all asset checks)")
     home2 = tempfile.mkdtemp(prefix="dq_full_")
     storage2 = os.path.join(home2, "storage")
     os.makedirs(storage2)

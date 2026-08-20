@@ -44,6 +44,16 @@ Transformations (dbt-trino or Trino SQL in Dagster)
 Gold Customer 360 marts
         ↓
 Streamlit dashboard (live Trino queries, port 8501)
+
+Streaming path (planned, Phases 11+ - see build order):
+stream_producer.py (seeded, simulated clock)
+        ↓
+Kafka (topic: raw.web_events)
+        ↓
+Flink (Kafka consumer → Iceberg append)
+        ↓
+bronze.stream_web_events ──▶ silver.fct_web_events merge
+                              (dedup on event_id) ──▶ gold
 ```
 
 ## Tech Stack (Locked)
@@ -59,6 +69,8 @@ Streamlit dashboard (live Trino queries, port 8501)
 | Transformations    | dbt-trino (preferred) or pure Trino SQL |                                 |
 | Data Quality       | dbt tests + Dagster asset checks |                                      |
 | Dashboard          | Streamlit + Plotly        | Thin local app querying Trino live (v1 was Superset, see notes) |
+| Streaming Bus      | Apache Kafka (KRaft, single node)    | Phase 11 done (web_events only in v1) |
+| Stream Processing  | Apache Flink + Iceberg Flink connector | Phase 12 done (Kafka → Iceberg append) |
 | Language           | Python 3.11+                  |                                            |
 
 ## Project Structure (Target)
@@ -93,7 +105,13 @@ ecommerce-customer-360-lakehouse/
 │   ├── dbt_project.yml
 │   └── profiles.yml
 ├── data_generator/
-│   └── generate_synthetic.py
+│   ├── generate_synthetic.py
+ │   └── stream_producer.py          # Phase 11: Kafka producer (replay/live)
+ ├── flink/                          # Phase 12
+ │   ├── Dockerfile                  # flink + iceberg-flink + hive/hadoop clients + S3A
+ │   ├── pom.xml                     # maven dependency closure for the image
+ │   ├── hadoop/core-site.xml        # S3A/MinIO config (mounted, HADOOP_CONF_DIR)
+ │   └── sql/stream_web_events.sql   # Flink SQL: Kafka → bronze.stream_web_events
 ├── dashboard/
 │   ├── app.py               # Streamlit dashboard (KPIs + 6 charts + profiles)
 │   └── marts.py             # the 11 gold-layer mart queries (single source of truth)
@@ -219,6 +237,110 @@ Build the core analytical models:
 - Environment variables documented
 - One-command startup experience as much as possible
 
+### Phase 11 – Streaming Bus: Kafka + Seeded Producer
+Streaming scope is **web_events only** in v1 (orders/payments deferred -
+Phase 15 backlog). Full Flink cluster, not Trino micro-batch - decision
+recorded in "Streaming design decisions" below.
+- Compose: + `kafka` (KRaft single node, port 9092; topic `raw.web_events`)
+- `data_generator/stream_producer.py` - reuses the generator's seeded RNG:
+  - `--replay`: full seeded web_events history at max speed; the emitted
+    payload set is bit-identical to data/synthetic/web_events.parquet
+  - `--live`: continues after max(event_date) on a simulated clock at a
+    configurable rate - never wall clock (determinism story intact)
+- Success criteria:
+  - topic exists; a consumer reads the emitted messages
+  - replay hash check passes (`scripts/verify_kafka.py`: hash of
+    event_id+payload == generator dataset)
+  - `make stream-up` / `make stream-down` manage the producer
+
+### Phase 12 – Flink → Iceberg (stream bronze)
+- Spike FIRST: the Flink Iceberg connector version must be compatible with
+  the v2 metadata Trino 483 + HMS writes. Test both directions (Trino
+  creates table → Flink appends → Trino reads back; Flink creates →
+  Trino reads/appends) BEFORE building the rest.
+- Custom Flink image (`flink/Dockerfile`): flink:1.2x-java17 +
+  iceberg-flink-runtime + hadoop-s3 plugin (MinIO endpoint, path-style
+  S3A, minioadmin creds)
+- Compose: + flink jobmanager (:8081) + 1 taskmanager; starts after
+  kafka + hive
+- `flink/stream_web_events.sql` (Flink SQL): Kafka connector (JSON format)
+  → APPEND into `iceberg.bronze.stream_web_events`, explicit
+  s3a://bronze/stream_web_events location, partitioned by day(event_date).
+  Append-only in Flink - dedup/conformance stays in silver.
+- Success criteria:
+  - Flink job RUNNING, checkpoints clean
+  - rows in bronze.stream_web_events == messages emitted
+    (`scripts/verify_stream.py`)
+  - Trino can query the stream table (incl. time travel)
+
+### Phase 13 – Silver Merge + DQ
+- `fct_web_events` spec → UNION ALL of bronze.web_events +
+  bronze.stream_web_events, dedup on event_id (ROW_NUMBER window); stat
+  metadata gains stream_rows / duplicates_dropped. fct_orders /
+  fct_payments unchanged in this scope.
+- Gold unchanged: customer_360 web engagement (cart adds, last event)
+  picks up merged events automatically; the 5-view revenue invariant is
+  structurally untouched (no money path in v1).
+- Dagster: virtual assets for the stream bronze table (ops query Trino for
+  counts/metadata - no fake lineage edges); new check families:
+  cross-source duplicate event_id, stream FK validity
+  (customer_id in silver.dim_customers), event-time monotonicity + lag.
+- Freshness: boundaries recomputed from all sources (stream rows carry
+  newer event dates than DATA_DATE_*).
+- Success: `make refresh` + `make verify` + `make verify-dq` green in
+  replay mode (zero data delta - every replayed event dedups out) and in a
+  short live window (conformance = bronze − drops + stream − dups).
+
+### Phase 14 – Live Dashboard + Ops
+- Dashboard "Live" panel: web event rate (events/min over last N minutes),
+  latest-events table, short TTL cache (10-30s)
+- Makefile: stream-up / stream-down / stream-live; `make run` orchestrates
+  replay + Flink job start (idempotent); `make reseed` resets the topic
+  (delete + recreate) then replays
+- README + PROJECT.md: architecture diagram with the streaming path;
+  demo script step "watch the live panel tick"
+- Success criteria: `make run` end-to-end green + live demo works + all
+  verify scripts PASS
+
+### Phase 15 (optional) – Hardening + Backlog
+(items 1-3 complete; item 4 left in the backlog as a future phase)
+- Flink checkpoints to S3 (durability across restarts)
+- Consumer-lag check in Dagster (on the virtual stream asset)
+- expire_snapshots / partition maintenance for the stream tables
+- Backlog: stream orders + payments (topics raw.orders / raw.payments,
+  merge into fct_orders / fct_payments) - same pattern as Phases 11-14,
+  higher business risk (money path)
+
+## Streaming Design Decisions (Phase 11+)
+
+- **Full Flink, not Trino micro-batch.** Canonical Kafka → Flink → Iceberg
+  real-time lakehouse; Trino's Kafka connector is batch-only and a
+  scheduled INSERT...SELECT FROM kafka would be micro-batching, not
+  streaming. Cost: +~3 GB RAM (Kafka + JM + TM) - document in README.
+- **web_events only in v1.** Append-only, no money path; orders/payments
+  deferred to the Phase 15 backlog.
+- **Separate stream bronze tables.** The batch full-refresh DROP+CTAS must
+  never race with live appends (same class of race as the Phase 10
+  layer-gate fix). Flink writes bronze.stream_web_events; silver merges.
+- **Silver is the merge point.** Dedup on event_id in silver SQL keeps the
+  spec-driven layer the single source of truth for conformance; Flink
+  stays a dumb append.
+- **Determinism.** Replay mode is bit-identical to the batch dataset, so
+  after replay + refresh every existing invariant holds with zero delta
+  (all stream rows dedup out). Live mode = simulated clock continuing
+  after max(event_date); no wall clock anywhere.
+- **Virtual Dagster assets for stream bronze.** Flink materializes outside
+  Dagster; virtual assets register counts/metadata via Trino queries to
+  keep lineage in the UI, and the new stream DQ checks attach there.
+- **Durable restarts (Phase 15).** Kafka source runs `scan.startup.mode=
+  group-offsets` + `properties.auto.offset.reset=earliest`, checkpoints are
+  durable at `s3a://flink-state/checkpoints` (10s interval, retained on
+  cancellation). Net effect: a graceful stop/start resumes exactly where it
+  left off (no re-append); a topic reset (reseed) has no group offsets and
+  replays from earliest. Only an ungraceful kill can leave the stream bronze
+  with at-least-once duplicates, which silver dedups and the
+  `event_id_unique` check surfaces.
+
 ## Coding & Style Guidelines for Pi Agent
 
 - Prefer clear, readable Python over clever one-liners
@@ -248,11 +370,371 @@ Build the core analytical models:
 
 ---
 
-**Current status:** Phases 0-10 complete - project done (scaffold, Docker Compose
+**Current status:** Phases 0-15 complete (scaffold, Docker Compose
 infrastructure, bootstrap lakehouse, Dagster project setup, synthetic data
 generator, bronze layer ingestion, silver layer transformations, gold
 Customer 360 marts, data quality & observability, Streamlit dashboard
-(v1 Superset, superseded), polish & one-command startup).
+(v1 Superset, superseded), polish & one-command startup, Kafka streaming bus
++ seeded producer, Flink -> Iceberg stream bronze, silver merge + DQ,
+live dashboard + ops, hardening).
+
+Phase 15 (hardening) complete: Flink checkpoints to S3 / durable restarts,
+non-blocking consumer-lag Dagster check, and snapshot + orphan-file
+maintenance (`make maintain`). Item 4 (stream orders + payments - the money
+path) was deliberately left in the backlog as a future phase (see the
+Phase 15 section, the "Phase 15 notes" entries and "Streaming design
+decisions" above).
+
+Phase 11 notes (streaming bus: Kafka + seeded producer) - complete:
+- Compose: + `kafka` (apache/kafka:3.7.2, KRaft single node, 512M heap) with
+  three listeners: PLAINTEXT -> localhost:9092 (HOST clients: producer,
+  scripts), INTERNAL -> kafka:9094 (CONTAINER clients - Flink in Phase 12),
+  CONTROLLER -> :9093 (KRaft quorum). The INTERNAL listener is required
+  because the host listener's advertised address (localhost:9092) is not
+  reachable from inside other containers. + one-shot `kafka-init` creates
+  raw.web_events (3 partitions, RF 1, --if-not-exists) via the INTERNAL
+  listener (same one-shot pattern as hive-jdbc-init).
+  GOTCHA: the apache/kafka image does not put /opt/kafka/bin on PATH -
+  healthcheck and kafka-init must call /opt/kafka/bin/kafka-topics.sh
+  explicitly (healthcheck silently failed otherwise; broker was fine).
+- data_generator/stream_producer.py (kafka-python 3.x in the venv):
+  --mode replay emits data/synthetic/web_events.parquet as JSON payloads at
+  max speed (~7k msg/s). Bit-identity is guaranteed by READING the Parquet,
+  not by re-deriving the RNG. --mode live replays first (unless
+  --skip-replay), then emits new events from a deterministic stream
+  SeedSequence([DATA_SEED, 0x4C495645]): simulated clock continuing after
+  max(event_date) (exponential inter-arrival, mean = history density),
+  event_id continues after the history (EVT-00050001...), customer_id 70%
+  sampled from the historical pool (FK-valid) / 30% null, --rate (default
+  20/s) only paces wall-clock arrival. Content is a function of
+  (seed, live-count) only - no wall clock anywhere. Flags: --reset-topic
+  (delete + recreate; used by `make reseed`), --if-empty (idempotent replay;
+  used by start_all.py so re-runs of `make run` don't double the topic).
+  kafka-python 3.x API notes: KafkaAdminClient takes no `timeout=` config;
+  TopicPartition imports from `kafka` (kafka.structs); Serializer/
+  Deserializer are ABCs with serialize(topic, headers, data) /
+  deserialize(topic, headers, data) - plain callables only warn.
+- scripts/verify_kafka.py: broker/topic reachable, partition count == 3,
+  full consume from offset 0, count == parquet rows, multiset sha256 over
+  canonical payload fields == parquet hash (replay bit-identical to batch),
+  event_ids exactly EVT-00000001..EVT-000NNNNN and unique. RESULT: PASS.
+- Makefile: stream-up (live producer detached, .logs/stream_producer.{pid,log},
+  refuses if already running), stream-down; `make down` also stops the
+  producer; `make reseed` = reset-topic + replay before refresh; `make verify`
+  includes verify_kafka. start_all.py: new step 4/7 (replay --if-empty),
+  kafka in the healthy-service set, verify suite + final summary line.
+- .env.example: KAFKA_BOOTSTRAP / KAFKA_TOPIC / STREAM_LIVE_RATE.
+- Verified: full `make run` green (235s: all 6 verify scripts RESULT: PASS,
+  lakehouse_refresh with all 85 checks green); `make verify` green; live mode
+  tested (sequential ids after history, monotonic simulated clock, ~30%
+  anonymous, exact 100 msg/s pacing, same-seed determinism, diff-seed
+   divergence); reset + replay + re-verify green.
+
+Phase 12 notes (Flink -> Iceberg stream bronze) - complete:
+- Spike (both directions, per the phase plan) PASSED before building:
+  Trino-created v2 table -> Flink INSERT -> Trino reads back; Flink-created
+  table (explicit s3a:// location) -> Trino INSERT -> Trino reads back.
+  Spike tables dropped + S3 dirs purged afterwards.
+- flink/Dockerfile (3 stages, image ecommerce-flink:1.20.3):
+  1. `apache/hive:3.1.3` - source of the Hive client jars. Iceberg 1.9.1's
+     hive module references org.apache.hadoop.hive.metastore.* at runtime but
+     declares NO hive dependency (verified in its poms). It is compiled
+     against the Hive 3.x client API (HiveCatalog/CachedClientPool reference
+     HiveConf.ConfVars.METASTOREURIS - a NoSuchFieldError with the Hive 4
+     client), while the Thrift protocol talks fine to the Hive 4.0.1 HMS.
+     The images thin hive-metastore-*.jar - the full client lives in
+     hive-standalone-metastore-3.1.3.jar.
+  2. maven: dependency closure of flink/pom.xml = iceberg-flink-1.20:1.9.1 +
+     flink-sql-connector-kafka:3.4.0-1.20, plus:
+     - flink-metrics-dropwizard:1.20.3 + metrics-core:4.2.30 -
+       IcebergStreamWriterMetrics references the com.codahale.metrics 4.x
+       API (Histogram/Reservoir/SlidingWindowReservoir) with no declared
+       dependency; the 1.20.3 flink-dist ships only a zookeeper-shaded copy.
+     - slf4j-api pinned to 1.7.36 - the closure otherwise pulls 2.0.x,
+       which ignores the Flink image's 1.7-style log4j2 binding => all
+       logs go to a NOP logger.
+  3. flink:1.20.3-scala_2.12-java17 + closure + flink-s3-fs-hadoop-1.20.3
+     (self-contained S3A; ships a TRIMMED hadoop-common) + Hadoop 3.3.6
+     client jars (common, hdfs-client, mapreduce-client core/common,
+     yarn-api - same Hadoop as the S3A jar) + the Hive 3.1.3 client set
+     (standalone-metastore, common, storage-api, libthrift, libfb303, guava,
+     commons-lang2).
+- Compose: + flink-jobmanager (healthcheck on :8081, 1600m) +
+  flink-taskmanager (2 slots). GOTCHA x3 found by tcpdump/thread-dumps:
+  1. HADOOP_CONF_DIR=/opt/flink/conf env - Flink 1.20's classpath is lib/*.jar
+     ONLY; conf/ is only reachable via HADOOP_CONF_DIR (appended by
+     config.sh), otherwise Hadoop's Configuration never sees core-site.xml.
+  2. fs.s3a.endpoint must carry the scheme: `http://minio:9000`. S3A
+     defaults to HTTPS for scheme-less endpoints - a TLS ClientHello to the
+     plain-HTTP MinIO port yields "400 Bad Request" and the AWS SDK retries
+     FOREVER (silent hang; no exception surfaces in Flink).
+  3. The default compose network was renamed to `lakehouse-net` (no
+     underscores): the Hive 3.x client canonicalizes the HMS host to
+     <container>.<network> and parses it as a java.net.URI, which rejects
+     underscores (URISyntaxException). Affects Flink only - Trino's shaded
+     client never canonicalizes.
+- flink/sql/stream_web_events.sql: CREATE CATALOG (hive) + table
+  (format-v2, explicit s3a:// location) + Kafka TEMPORARY TABLE
+  ('properties.bootstrap.servers'=kafka:9094 - the INTERNAL listener;
+  'properties.group.id'=bronze.stream_web_events - Flink 1.20 names it
+  properties.group.id, not group.id; 'format'=json; earliest-offset) +
+  INSERT. Mirrors the batch bronze tables (same schema + explicit s3a://
+  location rule).
+  PARTITIONED BY (event_date): Flink's Iceberg catalog supports only
+  IDENTITY partitioning in DDL (FlinkCatalog.toPartitionSpec - a TODO for
+  transforms), but day(x) == identity(x) physically for DATE columns.
+- OOM lesson (costly to find): PartitionedDeltaWriter holds ONE OPEN
+  parquet/zstd writer per active partition until a checkpoint closes them.
+  The 50k-event replay spans ~340 distinct event_date partitions => ~340
+  open writers before the first 10s checkpoint => OOM on the 537MB task
+  heap (2048m process) => infinite earliest-offset restart loop. Fix:
+  taskmanager.memory.process.size 4096m (~1.1GB task heap). Scales with
+  distinct-partition-count, not data volume.
+- Makefile: flink-up (REST /jobs/overview - job active? submit via
+  sql-client.sh -f, idempotent), flink-down (flink cancel by job name).
+  `make reseed` now: flink-down -> reset_stream.py -> topic reset + replay ->
+  refresh -> flink-up -> verify. `make verify` += verify_stream.
+- scripts/reset_stream.py: cancel job (REST DELETE), DROP TABLE via Trino
+  (also removes the S3 location), best-effort MinIO prefix purge.
+- scripts/verify_stream.py: job RUNNING (must pick the ACTIVE entry - the
+  overview lists job history incl. cancelled jobs), checkpoints
+  completed>=1 / failed==0, table row count catches up with the topic's
+  end-offsets (polled), no duplicate event_ids (one clean replay), full
+  history coverage (distinct >= parquet rows, min == EVT-00000001).
+- start_all.py: 8 steps - new step 5 = submit stream job if not active,
+  wait for RUNNING + 12s stability; flink-jobmanager in the healthy set;
+  verify suite + banner line.
+- Verified: production job ingested the full 50k replay (50,000 rows,
+  50,000 distinct, 70 checkpoints, 0 failed); `make reseed SEED=42` fully
+  green (stream reset + batch refresh + all verifies); `make run` fully
+  green (325s, 7/7 verify scripts PASS).
+
+Phase 13 notes (silver merge + DQ) - complete:
+- Virtual asset bronze/stream_web_events (assets/bronze/__init__.py):
+  read-only observer for the Flink-written table (no writes, no fake
+  lineage). Op: exists? (iceberg.information_schema.tables) -> if not,
+  dg.Failure with the actionable fix (`make flink-up`); if yes, rows /
+  distinct event_id / min-max event_date as run metadata (0 rows = first
+  checkpoint pending, reported not failed). Joins the bronze layer, so the
+  bronze gate waits for it and silver's fct_web_events gets a REAL upstream
+  dep (deps = ["web_events", "stream_web_events"]).
+- silver fct_web_events spec: UNION ALL of bronze.web_events +
+  bronze.stream_web_events (identical schemas), dedup on event_id via
+  row_number() OVER (PARTITION BY event_id ORDER BY src_rank) where batch =
+  1, stream = 2. On a duplicate the BATCH row wins: both sources carry the
+  identical payload per event_id and there is no arrival timestamp, so the
+  source rank exists only to make the dedup deterministic (documented in the
+  spec description). Stats: + stream_rows (pre), + duplicates_dropped
+  (post = in-batch + in-stream - out). Output schema unchanged, so gold is
+  untouched (customer_360 web engagement picks up merged events
+  automatically).
+- Ordering constraint (the phase's main gotcha): silver now READS the stream
+  table, so the stream must be committed AND caught up BEFORE any refresh.
+  * `make reseed` reordered: flink-down -> reset_stream -> topic
+    reset + replay -> flink-up -> verify_stream (catch-up gate, polls) ->
+    refresh -> verify.
+  * start_all.py: 9 steps - new step 6/9 runs verify_stream.py as the
+    catch-up gate between Flink submit and refresh.
+  * RACE FOUND: verify_stream.py asserted "checkpoint completed >= 1"
+    BEFORE its catch-up wait - a freshly submitted job legitimately has
+    zero completed checkpoints. Fixed by moving the checkpoint assertion
+    AFTER the catch-up poll.
+- 6 new asset checks (85 -> 91; verify_dq: 25 assets = 22 tables + 3 gates,
+  22 unit tests):
+  1. bronze gate web_events_cross_source_dups - event_ids in BOTH sources;
+     new condition "info" (always passes, reports the count: 50,000 in
+     replay, the replayed prefix in live).
+  2. bronze/stream_web_events event_id_unique - zero, NON-blocking: Flink is
+     at-least-once without persistent checkpoints in v1, so a job restart
+     re-appends events; silver absorbs them, this check surfaces them.
+  3. bronze/stream_web_events date_range - new range_kind "stream":
+     mn >= DATA_DATE_START AND mx >= DATA_DATE_END, NO upper bound (live
+     events extend the range); empty table (min/max NULL) -> fail
+     ("no committed rows yet"), non-blocking.
+  4. silver gate stream_customers_fk - every non-null stream customer_id in
+     silver.dim_customers (nulls are anonymous by design - the generic
+     _ref_sql would have counted them as orphans).
+  5. silver gate web_events_merge_reconcile - fct count == distinct
+     event_ids across both bronzes; boolean_true, NON-blocking: with a live
+     producer, rows can land between the CTAS and the check (the blocking
+     fct_web_events pk_unique check remains the correctness gate).
+  6. silver/fct_web_events date_range - same "stream" kind on the merged
+     table (freshness boundaries recomputed from all sources).
+- verify_silver.py: fct_web_events conformance = distinct event_ids across
+  batch + stream (not the batch row count anymore) + superset check
+  (merged >= batch) + merge info line (batch 50,000 + stream 50,000 ->
+  50,000 distinct, 50,000 deduped in replay).
+- verify_kafka.py made LIVE-aware: strict equality (count == history, full
+  multiset hash, exact id sequence) only in replay mode; with a live suffix
+  it checks count >= history, the multiset hash of the REPLAY SUBSET (ids in
+  the history set) vs the Parquet, and that live ids uniquely continue the
+  sequence (EVT-000NNNN1..). A double replay or second live run fails.
+- Verified:
+  * replay (zero delta): `make reseed SEED=42` green - fct_web_events
+    50,000 from 100,000 merged rows, 50,000 deduped, all gold invariants
+    unchanged ($15,221,141.27).
+  * live window: 300 live events (EVT-00050001..300, simulated clock
+    2025-01-01/02) -> refresh green (91 checks), fct_web_events 50,300,
+    gold.customer_360 last_event_date advanced to 2025-01-02 for 115
+    customers, GMV invariants untouched.
+  * `make verify-dq`: 22 unit tests + negative test + full run 91/91 checks,
+    25/25 assets. `make run` green (280s, 9 steps, 7/7 verifies). Final
+    `make reseed SEED=42` restored the canonical dataset.
+
+Phase 14 notes (live dashboard + ops) - complete:
+- Dashboard "Live stream (web events)" view: a sidebar radio toggle alongside
+  the existing gold view. The gold filters are now only rendered/queried when
+  the gold view is selected (they were unconditionally hitting Trino before).
+  The live panel is a `@st.fragment(run_every="15s")` so it polls on its own
+  without re-running the gold page.
+- Data access in `dashboard/live.py` (new module, all read-only, each function
+  degrades to an `error` field instead of raising so the panel renders a
+  friendly failure and the gold view is unaffected):
+  * `flink_job_status()` - Flink REST `/jobs/overview` + `/jobs/{jid}/checkpoints`
+    (RUNNING state, checkpoints completed, last checkpoint duration).
+  * `kafka_topic_end_offset()` - sum of end offsets over the topic's
+    partitions (the producer-side high-water mark).
+  * `stream_counts()` - batch/stream/merged row counts + newest event_id/date.
+  * `latest_events()` - newest 15 stream-bronze rows (event_id = arrival order).
+- Panel content: Flink job state + checkpoint progress; committed rows vs
+  Kafka end offset (delta = "caught up" / "N uncommitted"); a self-measured
+  event rate (row-count samples kept in `st.session_state`, ~events/min over
+  the gap between refreshes); last event id + date; batch/stream/merged source
+  counts (delta = "N deduped on event_id"); latest-events table; last-updated
+  caption.
+- Makefile: `dashboard` target now passes `--server.headless true` (it had
+  been prompting for onboarding email and exiting non-zero when run from a
+  TTY).
+- `make stream-up` gained `--if-empty` on the live producer: it only replays
+  the history preamble when the topic is actually empty, so starting a live
+  feed on top of an already-seeded topic does not double the history.
+- Live-window DQ: a running producer means the merged silver fact was
+  materialized at the last refresh, i.e. BEFORE newer live rows committed, so
+  strict `fct_web_events == union(batch, stream)` can be transiently false.
+  * verify_silver.py: samples the stream row count 3s apart; if it grew
+    ("live producer running") it re-samples the union and BOUND-checks
+    `batch_distinct <= fct_web_events <= current_union` instead of equality.
+    Static (no live producer) keeps the exact check.
+  * verify_dashboard.py: samples committed count BEFORE the topic end offset
+    (both monotonic, committed <= produced) so a stale end-offset sample can't
+    break the comparison under a live producer.
+- verify_dashboard.py gained a "live stream panel data sources" section
+  (7 checks): Flink job RUNNING, Kafka end offset readable, source counts
+  readable, merged >= batch (superset), merged <= batch+stream (dedup bound),
+  committed <= end offset, latest-events query returns unique event_ids.
+ - Ops note (SUPERSEDED by Phase 15 item 1): at this stage a stopped-and-
+   restarted Flink job re-consumed from the topic start (the DDL was pinned to
+   `scan.startup.mode=earliest-offset` and checkpoints lived on the container's
+   ephemeral filesystem) and re-appended the history, so the stream table
+   briefly held duplicates that silver deduped away. `make reseed SEED=42` is
+   the canonical reset (resets job + table + topic, re-replays, re-verifies)
+   and was re-run to leave the stack in the clean 50k state.
+- Verified:
+  * `make run` end-to-end green (9 steps, 7/7 verify scripts PASS) with the
+    live panel data sources checked.
+  * Live tick demo: `make stream-up` against a seeded topic (no double
+    replay); `stream_counts().stream_rows` and `last_event_id` advance in
+    real time (50,000 -> 50,348+), Flink job RUNNING with checkpoints
+    completing; AppTest renders both views (gold default + live toggle) with
+    no exceptions and the live metrics present.
+  * Full live-window `make verify`: 7/7 PASS with a live producer running
+    (26,000+ live events, silver bound-check, dashboard ordering check).
+  * Final `make reseed SEED=42` restored the canonical 50k/50k/50k dataset,
+    7/7 PASS.
+
+Phase 15 notes - item 1 (Flink checkpoints to S3, durable restarts) - complete:
+- Root cause of the re-consume-on-restart behavior: the Kafka source DDL was
+  pinned to `scan.startup.mode=earliest-offset`, so EVERY (re)start re-read
+  the whole topic, and checkpoints lived at `file:///opt/flink/checkpoints`
+  (JM container filesystem - wiped on container recreation).
+- Fix (flink/sql/stream_web_events.sql):
+  * `scan.startup.mode=group-offsets` - a restarted job resumes from the
+    consumer-group offsets that Flink commits on graceful cancellation, so no
+    re-consumption.
+  * `properties.auto.offset.reset=earliest` - REQUIRED companion: after
+    `make reseed` the topic is deleted+recreated and the group has no
+    committed offsets; without a reset policy the consumer crash-loops with
+    NoOffsetForPartitionException (found during the reseed test). With it, a
+    fresh topic falls back to earliest = full replay, exactly what the
+    rebuilt table needs.
+- Durable checkpoints (docker-compose.yml, flink-jobmanager):
+  `state.checkpoints.dir: s3a://flink-state/checkpoints` (new `flink-state`
+  MinIO bucket, created by bootstrap_minio.py / MINIO_BUCKET_FLINK),
+  `execution.checkpointing.externalized-checkpoint-retention:
+  RETAIN_ON_CANCELLATION` so cancelled jobs keep their checkpoint dirs.
+  S3A goes through the flink-s3-fs-hadoop plugin (already in the image) + the
+  mounted core-site.xml; TMs write checkpoint parts through the same config.
+- Verified:
+  * restart-resume: flink-down (graceful cancel commits group offsets) ->
+    JM container recreated -> flink-up -> table stays exactly 50,000 rows
+    (previously ballooned to 100,000 with duplicates). Proven twice,
+    including on a freshly rebuilt dataset.
+  * rebuild: `make reseed SEED=42` end-to-end green (topic reset -> earliest
+    fallback -> clean 50,000 replay, 0 duplicates, all 7 verify scripts PASS).
+  * checkpoints: 10+ completed at 10s interval under s3a://flink-state/
+    checkpoints/<jobId>/, stale chk dirs auto-cleaned, retained after
+    cancellation (both jobs observed).
+- The Phase 13 bronze check `event_id_unique` (non-blocking) now acts as
+  defense-in-depth: with durable restarts, within-stream duplicates should
+  only appear after an UNGRACEFUL kill (SIGKILL/power loss mid-checkpoint).
+
+Phase 15 notes - item 2 (consumer-lag Dagster check) - complete:
+- New non-blocking asset check `consumer_lag` on `bronze.stream_web_events`
+  (assets/checks.py): committed rows (existing count query) vs the Kafka
+  topic end offset (`_kafka_end_offset()`, kafka-python
+  KafkaConsumer.end_offsets over the topic's partitions; None when Kafka is
+  unreachable -> the check reports unavailable instead of failing). Pass =
+  `abs(lag) <= LAG_TOLERANCE` (default 1000, env STREAM_LAG_TOLERANCE).
+  Non-blocking: a transient lag or Kafka outage must never take the batch
+  pipeline down - it is a stream-health signal, not a correctness gate.
+- Counts: 91 -> 92 checks (verify_dq.py EXPECTED_CHECKS, definitions.py,
+  Makefile comment, README, dashboard footer). 5 new pure unit cases for the
+  `kafka_lag` condition in verify_dq.py (patched `_kafka_end_offset`, no I/O):
+  caught-up, within tolerance, beyond tolerance, end offset unavailable,
+  committed count missing.
+- Verified: `make verify-dq` green (92/92 checks, 25/25 assets, 27 unit
+  tests); live check reported "lag +0 (topic end_offset 50,000, committed
+  50,000, tolerance +/-1,000)".
+
+Phase 15 notes - item 3 (snapshot + orphan-file maintenance) - complete:
+- `scripts/maintain_iceberg.py` (+ Makefile `make maintain`): per Iceberg
+  table, `ALTER TABLE ... EXECUTE expire_snapshots` (skipped below 3
+  snapshots) then `remove_orphan_files`, with a MinIO size report
+  (bronze+silver+gold) before/after. Defaults: snapshots < 1h, orphans < 2h
+  (env MAINTAIN_SNAPSHOT_AGE / MAINTAIN_ORPHAN_AGE).
+- Trino 483 syntax note: these run as `ALTER TABLE ... EXECUTE` commands -
+  the older `CALL system.expire_snapshots(...)` procedure form is NOT
+  registered in this version ("Procedure not registered"). The connector's
+  default retention floor is 7d; the script lowers it per session
+  (`SET SESSION iceberg.*_min_retention = '10m'`), so no global catalog
+  config change is needed.
+- Safety margin: retention thresholds must stay far above the Flink
+  checkpoint interval (10s) - in-flight, not-yet-committed stream files are
+  seconds old, so a 2h orphan retention can never touch a file the running
+  job still needs.
+- Empirical finding: in this stack DROP TABLE + CTAS leaves NO orphan files
+  (verified by full MinIO inventory vs `table$files` across all tables: every
+  parquet is referenced; the only extras are the `raw/*` landing files
+  used by the bronze_raw Hive tables). Trino's DROP removes the table's
+  data files. So the real maintenance problem is SNAPSHOT accumulation: the
+  stream table gains a snapshot on every Flink checkpoint even while idle
+  (observed 26 -> 28 in a few minutes with no traffic). Orphan removal is
+  still kept as the cleanup for the one scenario that does produce orphans:
+  an ungraceful kill of the job mid-checkpoint (files written, never
+  committed).
+- Non-Iceberg tables (bronze_raw.* Hive landing tables, which the iceberg
+  catalog's information_schema still lists) are detected via the
+  "Not an Iceberg table" / missing `$snapshots` error and skipped with a
+  note; information_schema/system schemas are excluded from the table list.
+- Verified: proof run with 10m/10m retention expired 22 stream snapshots
+  (28 -> 6), MinIO 10.3 -> 10.2 MB, orphan scan classified all files
+  (deleted 0 - none exist); afterwards the Flink job stayed RUNNING and the
+  stream table still read exactly 50,000 rows; `make verify` 7/7 green.
+- Bug found while testing: dashboard live.py `flink_job_status()` picked the
+  FIRST name-matching job from /jobs/overview, and after several reseed
+  cycles the list holds stale CANCELED runs before the RUNNING one - the
+  live panel (and verify_dashboard) then reported state=CANCELED. Fixed to
+  prefer a RUNNING match.
 
 Phase 9 notes (v2: Streamlit - final dashboard):
 - dashboard/marts.py = the 11 gold-layer mart queries (single source of
