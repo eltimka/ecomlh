@@ -250,9 +250,11 @@ services:
       - |
         set -e
         echo "Creating Kafka topics (if not exists)..."
-        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9094 \
-          --create --topic raw.web_events \
-          --partitions 3 --replication-factor 1 --if-not-exists
+        for t in raw.web_events raw.orders raw.order_items raw.payments; do
+          /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9094 \
+            --create --topic "$$t" \
+            --partitions 3 --replication-factor 1 --if-not-exists
+        done
         echo "Kafka topics ready."
     depends_on:
       kafka:
@@ -311,12 +313,13 @@ services:
       HADOOP_CONF_DIR: /opt/flink/conf
       FLINK_PROPERTIES: |
         jobmanager.rpc.address: flink-jobmanager
-        taskmanager.numberOfTaskSlots: 2
-        # 4096m (=> ~1.1GB task heap): the Iceberg sink keeps one open
-        # parquet/zstd writer per active partition until a checkpoint, and
-        # the replay spans ~340 distinct event_date partitions - 2048m
-        # (537MB task heap) OOMed before the first checkpoint.
-        taskmanager.memory.process.size: 4096m
+        # 8 slots: 4 stream jobs x (kafka source + iceberg sink) = 8 tasks.
+        # 11264m (=> ~1.1GB task heap per slot): the Iceberg sink keeps one
+        # open parquet/zstd writer per active partition until a checkpoint,
+        # and each replay spans ~340-366 distinct date partitions - less
+        # per-slot heap OOMed before the first checkpoint (Phase 12).
+        taskmanager.numberOfTaskSlots: 8
+        taskmanager.memory.process.size: 11264m
     volumes:
       - ../flink/hadoop/core-site.xml:/opt/flink/conf/core-site.xml:ro
     depends_on:

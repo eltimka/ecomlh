@@ -1,22 +1,18 @@
 #!/usr/bin/env python3
-"""Verify the Phase 11 streaming bus (Kafka + seeded producer).
+"""Verify the streaming bus (Kafka) for all four topics.
 
-Checks (Kafka must be up; run after `make run` or `make reseed` - the topic
-holds one replay of the batch web_events history, optionally followed by
-live events from `make stream-up`):
-  1. Kafka broker is reachable and the topic exists.
-  2. The topic has the expected partition count.
-  3. The topic's messages can all be consumed from offset 0.
-  4. Message count == data/synthetic/web_events.parquet row count (replay
-     mode) or >= it (live mode: replay + live suffix).
-  5. Content hash of the replay subset (per-row sha256 over the canonical
-     payload fields, multiset) == the same hash computed over the Parquet
-     file - i.e. the replay is bit-identical to the batch dataset.
-  6. event_ids are unique; in replay mode they form the exact sequence
-     EVT-00000001..EVT-000NNNNN; in live mode the suffix continues the
-     sequence (EVT-000NNNN1..).
+For every stream in stream_spec.STREAM_SPECS (web_events + the Phase 15 money
+path), run after `make run` or `make reseed` - each topic holds one replay of
+its batch history, optionally followed by live rows from `make stream-up`:
+   1. The topic exists with the expected partition count.
+   2. All messages are consumable from offset 0.
+   3. Message count >= history rows (== in replay mode, > in live mode).
+   4. Content hash of the replay subset (per-row sha256 over every payload
+      column, multiset) == the same hash over the Parquet file - the replay
+      is bit-identical to the batch dataset.
+   5. Primary keys are unique.
 
-Exit code 0 + "RESULT: PASS" when everything is green.
+Exit code 0 + "RESULT: PASS" when every topic is green.
 """
 
 from __future__ import annotations
@@ -26,6 +22,7 @@ import json
 import os
 import sys
 import time
+from datetime import date, datetime
 from pathlib import Path
 
 import polars as pl
@@ -34,32 +31,64 @@ from dotenv import load_dotenv
 REPO_ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(REPO_ROOT / ".env")
 
+from stream_spec import STREAM_SPECS
+
 KAFKA_BOOTSTRAP = os.environ.get("KAFKA_BOOTSTRAP", "localhost:9092")
-KAFKA_TOPIC = os.environ.get("KAFKA_TOPIC", "raw.web_events")
 EXPECTED_PARTITIONS = 3
-HISTORY = REPO_ROOT / "data" / "synthetic" / "web_events.parquet"
 CONSUME_TIMEOUT_MS = 20_000
-CONSUME_DEADLINE_S = 120
+CONSUME_DEADLINE_S = 180
 
 
-def _row_digest(payload: dict) -> str:
-    """Order-independent per-row digest over the canonical payload fields."""
-    raw = "|".join(
-        [
-            payload["event_id"],
-            payload["customer_id"] or "NULL",
-            payload["event_type"],
-            payload["category"],
-            payload["device"],
-            payload["event_date"],
-        ]
-    )
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+def _canonical(payload: dict, columns: list[str]) -> str:
+    parts = []
+    for c in columns:
+        v = payload.get(c)
+        if v is None:
+            parts.append("NULL")
+        elif isinstance(v, (date, datetime)):
+            parts.append(v.isoformat())
+        else:
+            parts.append(str(v))
+    return "|".join(parts)
 
 
-def _multiset_hash(rows) -> str:
-    digests = sorted(_row_digest(r) for r in rows)
+def _row_digest(payload: dict, columns: list[str]) -> str:
+    return hashlib.sha256(_canonical(payload, columns).encode("utf-8")).hexdigest()
+
+
+def _multiset_hash(rows, columns: list[str]) -> str:
+    digests = sorted(_row_digest(r, columns) for r in rows)
     return hashlib.sha256("\n".join(digests).encode("utf-8")).hexdigest()
+
+
+def consume_all(topic: str) -> tuple[list[dict], int]:
+    """Consume every message from offset 0; return (payloads, partition_count)."""
+    from kafka import KafkaConsumer
+    from kafka.serializer import Deserializer
+
+    class JsonDeserializer(Deserializer):
+        def deserialize(self, topic: str, headers, data: bytes):
+            return json.loads(data)
+
+    consumer = KafkaConsumer(
+        topic,
+        bootstrap_servers=KAFKA_BOOTSTRAP,
+        auto_offset_reset="earliest",
+        value_deserializer=JsonDeserializer(),
+        group_id=f"verify-{int(time.time() * 1000)}",
+        consumer_timeout_ms=CONSUME_TIMEOUT_MS,
+    )
+    try:
+        parts = sorted(consumer.partitions_for_topic(topic) or set())
+        messages: list[dict] = []
+        t0 = time.time()
+        for msg in consumer:
+            messages.append(msg.value)
+            if time.time() - t0 > CONSUME_DEADLINE_S:
+                break
+        return messages, len(parts)
+    finally:
+        consumer.close()
 
 
 def main() -> int:
@@ -70,16 +99,11 @@ def main() -> int:
         if not ok:
             failures.append(name)
 
-    print("Kafka streaming bus verification (Phase 11)")
+    print(f"Kafka streaming bus verification ({len(STREAM_SPECS)} topics)")
     print("=" * 60)
 
-    if not HISTORY.exists():
-        print(f"RESULT: FAIL - {HISTORY} missing (run generate_synthetic.py / make run first)")
-        return 1
-    history = pl.read_parquet(HISTORY)
-
-    # ------------------------------------------------------------------ 1+2.
-    print("[1] broker reachable, topic exists")
+    # ------------------------------------------------------------------ 1.
+    print("[1] broker reachable, topics exist")
     try:
         from kafka.admin import KafkaAdminClient
 
@@ -87,114 +111,78 @@ def main() -> int:
         topics = client.list_topics()
         client.close()
         check("broker reachable", True, KAFKA_BOOTSTRAP)
-        check(f"topic '{KAFKA_TOPIC}' exists", KAFKA_TOPIC in topics, f"{len(topics)} topic(s)")
+        for spec in STREAM_SPECS:
+            check(f"topic '{spec.topic}' exists", spec.topic in topics, f"{len(topics)} topic(s)")
     except Exception as exc:  # noqa: BLE001
         check("broker reachable", False, str(exc)[:120])
         print("=" * 60)
         print("RESULT: FAIL - kafka broker not reachable")
         return 1
 
-    # ------------------------------------------------------------------ 3.
-    print("[2] consume all messages from offset 0")
-    messages: list[dict] = []
-    try:
-        from kafka import KafkaConsumer
-        from kafka.serializer import Deserializer
+    for spec in STREAM_SPECS:
+        if not spec.history.exists():
+            print(f"RESULT: FAIL - {spec.history} missing (run generate_synthetic.py / make run first)")
+            return 1
+        history = pl.read_parquet(spec.history)
+        columns = history.columns
+        n_hist = len(history)
+        hist_rows = list(history.select(columns).iter_rows(named=True))
+        hist_ids = {r[spec.pk] for r in hist_rows}
+        h_hist = _multiset_hash(hist_rows, columns)
 
-        class JsonDeserializer(Deserializer):
-            def deserialize(self, topic: str, headers, data: bytes):
-                return json.loads(data)
+        # ------------------------------------------------------------------ 2+3.
+        print(f"[2] {spec.key}: consume + partitions")
+        try:
+            messages, n_parts = consume_all(spec.topic)
+            check(f"{spec.key}: partition count == {EXPECTED_PARTITIONS}", n_parts == EXPECTED_PARTITIONS, f"got {n_parts}")
+        except Exception as exc:  # noqa: BLE001
+            check(f"{spec.key}: consumption completed", False, str(exc)[:120])
+            continue
 
-        consumer = KafkaConsumer(
-            KAFKA_TOPIC,
-            bootstrap_servers=KAFKA_BOOTSTRAP,
-            auto_offset_reset="earliest",
-            value_deserializer=JsonDeserializer(),
-            group_id=f"verify-{int(time.time() * 1000)}",
-            consumer_timeout_ms=CONSUME_TIMEOUT_MS,
-        )
-        parts = sorted(consumer.partitions_for_topic(KAFKA_TOPIC) or set())
+        if not messages:
+            check(f"{spec.key}: messages present", False, "topic empty (run the producer replay first)")
+            continue
+        check(f"{spec.key}: consumption completed", True, f"{len(messages):,} messages")
+
+        # ------------------------------------------------------------------ 4.
+        n_total = len(messages)
+        n_live = n_total - n_hist
+        live_mode = n_total > n_hist
         check(
-            f"partition count == {EXPECTED_PARTITIONS}",
-            len(parts) == EXPECTED_PARTITIONS,
-            f"got {len(parts)}",
+            f"{spec.key}: message count {'>' if live_mode else '='} history rows ({n_hist:,})",
+            n_total >= n_hist,
+            f"topic has {n_total:,}" + (f" ({n_live:,} live rows)" if live_mode else ""),
         )
-        t0 = time.time()
-        for msg in consumer:
-            messages.append(msg.value)
-            if time.time() - t0 > CONSUME_DEADLINE_S:
-                break
-        consumer.close()
-        check("consumption completed", True, f"{len(messages):,} messages in {time.time() - t0:.1f}s")
-    except Exception as exc:  # noqa: BLE001
-        check("consumption completed", False, str(exc)[:120])
-        messages = []
 
-    if not messages:
-        print("=" * 60)
-        print("RESULT: FAIL - no messages in the topic (run the producer replay first: make run / make reseed)")
-        return 1
-
-    # ------------------------------------------------------------------ 4.
-    hist_rows = [
-        {**row, "event_date": row["event_date"].isoformat()}
-        for row in history.select(
-            ["event_id", "customer_id", "event_type", "category", "device", "event_date"]
-        ).iter_rows(named=True)
-    ]
-    n_hist = len(history)
-    hist_ids = {r["event_id"] for r in hist_rows}
-    h_hist = _multiset_hash(hist_rows)
-
-    # ------------------------------------------------------------------ 5.
-    print("[3] counts")
-    n_total = len(messages)
-    n_live = n_total - n_hist
-    live_mode = n_total > n_hist
-    check(
-        f"message count {'>' if live_mode else '='} history rows ({n_hist:,})",
-        n_total >= n_hist,
-        f"topic has {n_total:,}" + (f" ({n_live:,} live events)" if live_mode else ""),
-    )
-
-    # ------------------------------------------------------------------ 6.
-    print("[4] replay determinism (content hash vs Parquet)")
-    # live mode: only the replay subset (history event_ids) is checked
-    # against the Parquet hash; the live suffix is checked structurally
-    replay_subset = [m for m in messages if m["event_id"] in hist_ids]
-    h_topic = _multiset_hash(replay_subset)
-    check(
-        "content hash matches web_events.parquet" + (" (replay subset)" if live_mode else ""),
-        h_topic == h_hist,
-        f"topic={h_topic[:16]}... parquet={h_hist[:16]}...",
-    )
-
-    # ------------------------------------------------------------------ 7.
-    print("[5] event_id sequence")
-    ids = [m["event_id"] for m in messages]
-    check("event_ids unique", len(set(ids)) == len(ids), f"{len(set(ids)):,} unique of {len(ids):,}")
-    if live_mode:
-        live_ids = [i for i in ids if i not in hist_ids]
-        expected_live = {f"EVT-{n_hist + i + 1:08d}" for i in range(n_live)}
+        # ------------------------------------------------------------------ 5.
+        print(f"[3] {spec.key}: replay determinism")
+        replay_subset = [m for m in messages if m[spec.pk] in hist_ids]
+        h_topic = _multiset_hash(replay_subset, columns)
         check(
-            f"live event_ids continue the sequence (EVT-{n_hist + 1:08d}..)",
-            set(live_ids) == expected_live,
-            f"{len(live_ids):,} live ids, first={min(live_ids) if live_ids else '-'}",
+            f"{spec.key}: content hash matches {spec.history.name}" + (" (replay subset)" if live_mode else ""),
+            h_topic == h_hist,
+            f"topic={h_topic[:16]}... parquet={h_hist[:16]}...",
         )
-    else:
-        expected = {f"EVT-{i + 1:08d}" for i in range(n_hist)}
+
+        # ------------------------------------------------------------------ 6.
+        ids = [m[spec.pk] for m in messages]
         check(
-            "event_ids == EVT-00000001..EVT-000NNNNN",
-            set(ids) == expected,
-            f"first={ids[0]} last={ids[-1]}",
+            f"{spec.key}: {spec.pk}s unique",
+            len(set(ids)) == len(ids),
+            f"{len(set(ids)):,} unique of {len(ids):,}",
         )
+        if live_mode:
+            check(
+                f"{spec.key}: live suffix disjoint from history",
+                len([i for i in ids if i not in hist_ids]) == n_live,
+                f"{n_live:,} live ids",
+            )
 
     print("=" * 60)
     if failures:
         print(f"RESULT: FAIL - {len(failures)} check(s) failed: {failures}")
         return 1
-    suffix = f" + {n_live:,} live events" if live_mode else ""
-    print(f"RESULT: PASS - kafka streaming bus verified (replay bit-identical to batch{suffix})")
+    print("RESULT: PASS - kafka streaming bus verified (all replays bit-identical to batch)")
     return 0
 
 

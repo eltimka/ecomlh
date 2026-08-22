@@ -148,75 +148,81 @@ def _bronze_asset(table: str):
 bronze_assets: list = [_bronze_asset(table) for table in BRONZE_TABLES]
 
 
-def _stream_web_events_asset():
-    """Virtual asset for ``iceberg.bronze.stream_web_events`` (Phase 13).
+def _stream_asset(name: str, pk: str, date_col: str | None):
+    """Virtual asset for one ``iceberg.bronze.stream_*`` table.
 
-    That Iceberg table is written by the Flink job (Phase 12), not by
-    Dagster. This asset therefore does not write anything - its op observes
-    the table through Trino (existence, row count, event-date range) and
-    reports it as run metadata, so the stream source shows up in the asset
-    graph and silver's merge has a real upstream to depend on. If the table
-    does not exist yet the op fails with the actionable fix (``make
-    flink-up``), because the silver merge reads it unconditionally.
+    The table is written by a Flink job (Phases 11-13 web events, Phase 15
+    item 4 money path), not by Dagster. The asset writes nothing - its op
+    observes the table through Trino (existence, row count, distinct pk,
+    date range) and reports it as run metadata, so the stream source shows
+    up in the asset graph and silver's merge has a real upstream to depend
+    on. Fails with the actionable fix (``make flink-up``) if the table is
+    missing, because the silver merge reads it unconditionally.
     """
+
+    fq = f"iceberg.bronze.{name}"
 
     @dg.asset(
         key_prefix=("bronze",),
-        name="stream_web_events",
+        name=name,
         description=(
-            "Virtual observer for bronze.stream_web_events: the table is "
-            "written by the Flink job (append-only), this op only queries "
-            "its state through Trino. Fails until the stream job has "
-            "created the table (make flink-up)."
+            f"Virtual observer for bronze.{name}: the table is written by "
+            "the Flink job (append-only), this op only queries its state "
+            "through Trino. Fails until the stream job has created the "
+            "table (make flink-up)."
         ),
     )
-    def stream_web_events_asset(
-        context: AssetExecutionContext, trino: TrinoResource
-    ) -> None:
+    def stream_asset(context: AssetExecutionContext, trino: TrinoResource) -> None:
         (exists,) = trino.fetch(
             "SELECT count(*) FROM iceberg.information_schema.tables "
             "WHERE table_catalog = 'iceberg' AND table_schema = 'bronze' "
-            "AND table_name = 'stream_web_events'"
+            f"AND table_name = '{name}'"
         )[0]
         if not int(exists):
             raise dg.Failure(
-                "iceberg.bronze.stream_web_events does not exist - the Flink "
-                "stream job has never run. Submit it with `make flink-up` "
-                "(it creates the table and ingests the topic)."
+                f"{fq} does not exist - the Flink stream job has never run. "
+                "Submit it with `make flink-up` (it creates the table and "
+                "ingests the topic)."
             )
-        (rows,) = trino.fetch("SELECT count(*) FROM iceberg.bronze.stream_web_events")[0]
+        (rows,) = trino.fetch(f"SELECT count(*) FROM {fq}")[0]
         meta: dict[str, int | str] = {
-            "table": "iceberg.bronze.stream_web_events",
+            "table": fq,
             "rows": int(rows),
             "written_by": "flink (make flink-up)",
         }
         if int(rows) > 0:
-            (mn, mx) = trino.fetch(
-                "SELECT min(event_date), max(event_date) "
-                "FROM iceberg.bronze.stream_web_events"
-            )[0]
-            (distinct,) = trino.fetch(
-                "SELECT count(DISTINCT event_id) FROM iceberg.bronze.stream_web_events"
-            )[0]
-            meta["min_event_date"] = str(mn)
-            meta["max_event_date"] = str(mx)
-            meta["distinct_event_id"] = int(distinct)
+            (distinct,) = trino.fetch(f"SELECT count(DISTINCT {pk}) FROM {fq}")[0]
+            meta[f"distinct_{pk}"] = int(distinct)
+            if date_col:
+                (mn, mx) = trino.fetch(f"SELECT min({date_col}), max({date_col}) FROM {fq}")[0]
+                meta[f"min_{date_col}"] = str(mn)
+                meta[f"max_{date_col}"] = str(mx)
         else:
             meta["note"] = "0 rows committed yet (first checkpoint pending)"
         context.add_output_metadata(meta)
-        context.log.info(f"bronze.stream_web_events (virtual): {meta}")
+        context.log.info(f"bronze.{name} (virtual): {meta}")
 
-    return stream_web_events_asset
+    return stream_asset
+
+
+#: (stream table name, primary key, date column or None) - one per Flink job
+STREAM_ASSET_SPECS: list[tuple[str, str, str | None]] = [
+    ("stream_web_events", "event_id", "event_date"),
+    ("stream_orders", "order_id", "order_date"),
+    ("stream_order_items", "order_item_id", None),
+    ("stream_payments", "payment_id", "payment_date"),
+]
 
 
 #: table name -> asset definition, for wiring downstream `deps=[...]` (lineage)
 BRONZE_ASSETS_BY_NAME = {a.key.path[-1]: a for a in bronze_assets}
 
-# The virtual stream asset joins the layer (before the gate, so the gate
-# waits for it too) and silver's fct_web_events depends on it for lineage.
-_stream_web_events = _stream_web_events_asset()
-bronze_assets.append(_stream_web_events)
-BRONZE_ASSETS_BY_NAME["stream_web_events"] = _stream_web_events
+# The virtual stream assets join the layer (before the gate, so the gate
+# waits for them too) and silver's fct_* merges depend on them for lineage.
+for _name, _pk, _date_col in STREAM_ASSET_SPECS:
+    _stream_a = _stream_asset(_name, _pk, _date_col)
+    bronze_assets.append(_stream_a)
+    BRONZE_ASSETS_BY_NAME[_name] = _stream_a
 
 # Barrier asset for cross-table checks (referential integrity between
 # bronze tables runs only after every bronze table is committed).

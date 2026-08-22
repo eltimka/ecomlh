@@ -36,6 +36,8 @@ from live import (  # noqa: E402  (script-dir import; streamlit adds it to sys.p
     flink_job_status,
     kafka_topic_end_offset,
     latest_events,
+    latest_orders,
+    money_stream_summary,
     stream_counts,
 )
 from marts import MARTS, build_sql  # noqa: E402
@@ -164,7 +166,7 @@ with st.sidebar:
     st.divider()
     st.markdown(
         "**Pipeline**: Dagster job `lakehouse_refresh` (bronze → silver → gold, "
-        "92 DQ checks).\n\n"
+        "109 DQ checks).\n\n"
         "**Data**: synthetic, seeded (`DATA_SEED`). Re-seed with "
         "`make reseed SEED=<n>` to see the whole pipeline react to new data.\n\n"
         "**Stack**: MinIO · Iceberg · Trino · Dagster · Streamlit."
@@ -275,15 +277,50 @@ def _live_panel() -> None:
             },
         )
 
+    # ------------------------------------------------------------------ money
+    st.markdown(
+        "**Money path (orders / items / payments)** - Phase 15: the order "
+        "stream flows Kafka → Flink → Iceberg → silver merge → gold."
+    )
+    try:
+        money = money_stream_summary()
+        mrows = []
+        for key, e in money["streams"].items():
+            rows, kend = e.get("stream_rows"), e.get("kafka_end")
+            mrows.append({
+                "stream": key,
+                "flink job": e.get("job_state") or "n/a",
+                "kafka end offset": kend if kend is not None else "-",
+                "committed rows": rows if rows is not None else "-",
+                "uncommitted": (kend - rows) if (rows is not None and kend is not None) else "-",
+            })
+        st.dataframe(pd.DataFrame(mrows), use_container_width=True, hide_index=True, height=160)
+        if money["streams"].get("orders", {}).get("stream_rows"):
+            odf = latest_orders()
+            if not odf.empty:
+                st.markdown("**Latest orders (stream bronze, newest first)**")
+                st.dataframe(
+                    odf, use_container_width=True, hide_index=True, height=220,
+                    column_config={
+                        "order_id": st.column_config.TextColumn("Order"),
+                        "customer_id": st.column_config.TextColumn("Customer"),
+                        "channel": st.column_config.TextColumn("Channel"),
+                        "total_amount": st.column_config.NumberColumn("Total", format="%.2f"),
+                    },
+                )
+    except Exception as exc:  # noqa: BLE001 - money stream may not exist yet
+        st.warning(f"Money stream not readable yet. <small>{str(exc)[:160]}</small>")
+
     st.caption(f"Last updated {time.strftime('%H:%M:%S')} - auto-refreshes every 15s.")
 
 
 if view == LIVE_VIEW:
-    st.title("Live stream (web events)")
+    st.title("Live stream (web events + money path)")
     st.caption(
-        "Kafka (`raw.web_events`) → Flink (append) → Iceberg "
-        "(`iceberg.bronze.stream_web_events`) → silver dedup merge → gold. "
-        "This panel polls the running stack; `make stream-up` feeds it."
+        "Kafka (`raw.web_events`, `raw.orders`, `raw.order_items`, "
+        "`raw.payments`) → Flink (append) → Iceberg (`iceberg.bronze.stream_*`) "
+        "→ silver dedup merge → gold. This panel polls the running stack; "
+        "`make stream-up` feeds it."
     )
     _live_panel()
     st.stop()

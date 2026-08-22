@@ -90,12 +90,15 @@ def main() -> int:
 
     check(f"KPI customers = manifest count", customers == n_customers,
           f"got {customers:,}, expected {n_customers:,}")
-    check(f"KPI orders = manifest count", orders == n_orders,
-          f"got {orders:,}, expected {n_orders:,}")
+    # >= manifest: live orders (from the stream producer) grow the total;
+    # customers are batch-pool samples so they never exceed the manifest count
+    check(f"KPI orders >= manifest count", orders >= n_orders,
+          f"got {orders:,}, manifest {n_orders:,}")
     check("KPI GMV = silver valid-order revenue (cross-layer)",
           abs(gmv - silver_gmv) < 0.01, f"gold {gmv:,.2f} vs silver {silver_gmv:,.2f}")
     check("KPI AOV in (0, 10,000)", 0 < aov < 10_000, f"got {aov:,.2f}")
-    check("revenue trend has 12 months (Jan-Dec 2024)", len(results["revenue_trend"]) == 12,
+    check("revenue trend has the 12-month history (+ any live tail)",
+          len(results["revenue_trend"]) >= 12,
           f"got {len(results['revenue_trend'])}")
     check("channel mix has 3 channels", len(results["channel_mix"]) == 3,
           f"got {len(results['channel_mix'])}")

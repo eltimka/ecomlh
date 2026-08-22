@@ -7,15 +7,16 @@ Steps (each idempotent - safe to re-run at any time):
   1. docker compose up -d + wait until the stack is healthy
   2. generate synthetic data if data/synthetic/ is missing
   3. bootstrap MinIO buckets + Trino schemas
-  4. replay the web_events history into Kafka (skip if the topic already
-     has messages - keeps re-runs idempotent; `make reseed` resets it)
-  5. submit the Flink stream job (Kafka -> Iceberg bronze.stream_web_events)
-     if it is not already running
-  6. wait until the stream table is caught up with the topic (the silver
-     merge reads it - verify_stream.py, polled)
+  4. replay the batch history into Kafka - all 4 topics (web_events, orders,
+     order_items, payments); per-topic, skipped when already seeded (keeps
+     re-runs idempotent; `make reseed` resets it)
+  5. submit the 4 Flink stream jobs (Kafka -> Iceberg bronze.stream_*) if
+     not already running
+  6. wait until all stream tables are caught up with their topics (the silver
+     merge reads them - verify_stream.py, polled)
   7. start the Streamlit Customer 360 dashboard (port 8501)
   8. run the lakehouse_refresh Dagster job (bronze -> silver -> gold
-     with all 91 data-quality checks)
+      with all 109 data-quality checks)
   9. run the quick verification suite
      (lakehouse, kafka, stream, bronze, silver, gold, dashboard)
 
@@ -52,8 +53,8 @@ LONG_RUNNING = {
     "flink-jobmanager",
 }
 
-# the Flink streaming job (name Flink derives from the INSERT statement)
-STREAM_JOB_NAME = "insert-into_iceberg.bronze.stream_web_events"
+from stream_spec import STREAM_SPECS
+
 FLINK_REST = "http://localhost:8081"
 
 
@@ -134,53 +135,67 @@ def step_bootstrap() -> None:
 
 def step_stream() -> None:
     print("=" * 62)
-    print("[4/8] replay web_events history into Kafka (idempotent)")
+    print("[4/8] replay batch history into Kafka - all 4 topics (idempotent)")
     print("=" * 62)
     proc = run([str(VENV / "python"), "data_generator/stream_producer.py", "--mode", "replay", "--if-empty"])
     if proc.returncode != 0:
         fail("kafka replay failed")
 
 
-def flink_stream_job_state() -> str | None:
-    """State of the stream job if it is active (RUNNING/RESTARTING), else None."""
+def flink_job_states() -> dict[str, str | None]:
+    """Active state (RUNNING/RESTARTING) of each stream job, keyed by spec.key."""
     try:
         with urllib.request.urlopen(f"{FLINK_REST}/jobs/overview", timeout=3) as r:
             jobs = json.load(r)["jobs"]
     except Exception:
-        return None
-    for j in jobs:
-        if j["name"] == STREAM_JOB_NAME and j["state"] in ("RUNNING", "RESTARTING"):
-            return j["state"]
-    return None
+        return {s.key: None for s in STREAM_SPECS}
+    states = {j["name"]: j["state"] for j in jobs}
+    out = {}
+    for s in STREAM_SPECS:
+        out[s.key] = states[s.job] if states[s.job] in ("RUNNING", "RESTARTING") else None
+    return out
+
+
+def _submit_flink_job(sql_file: str) -> None:
+    cmd = COMPOSE + ["exec", "-T", "flink-jobmanager",
+                     "./bin/sql-client.sh", "-f", f"/opt/flink/sql/{sql_file}"]
+    proc = run(cmd)
+    if proc.returncode != 0:
+        fail(f"flink job submission failed ({sql_file})")
 
 
 def step_flink() -> None:
     print("=" * 62)
-    print("[5/8] Flink stream job (Kafka -> Iceberg bronze.stream_web_events)")
+    print(f"[5/8] Flink stream jobs (Kafka -> Iceberg, {len(STREAM_SPECS)} streams)")
     print("=" * 62)
-    state = flink_stream_job_state()
-    if state is not None:
-        print(f"  stream job already {state} - skipping submit")
+    states = flink_job_states()
+    to_submit = [s for s in STREAM_SPECS if states[s.key] is None]
+    for s in STREAM_SPECS:
+        if states[s.key]:
+            print(f"  {s.key}: already {states[s.key]} - skipping submit")
+        else:
+            print(f"  {s.key}: submitting {s.topic}.sql")
+    if not to_submit:
         return
-    cmd = COMPOSE + ["exec", "-T", "flink-jobmanager",
-                     "./bin/sql-client.sh", "-f", "/opt/flink/sql/stream_web_events.sql"]
-    proc = run(cmd)
-    if proc.returncode != 0:
-        fail("flink job submission failed")
-    deadline = time.time() + 180
-    seen_running = False
+    for s in to_submit:
+        _submit_flink_job(f"stream_{s.key}.sql")
+    deadline = time.time() + 240
+    seen: dict[str, bool] = {s.key: False for s in to_submit}
     while time.time() < deadline:
-        state = flink_stream_job_state()
-        if state == "RUNNING":
-            seen_running = True
-            time.sleep(12)  # give a failing job a moment to restart
-            if flink_stream_job_state() in ("RUNNING", "RESTARTING"):
-                print("  stream job is RUNNING")
+        states = flink_job_states()
+        for s in to_submit:
+            if states[s.key]:
+                seen[s.key] = True
+        if all(seen[s.key] for s in to_submit):
+            # all reached RUNNING at some point - give a failing job a moment
+            time.sleep(12)
+            states = flink_job_states()
+            if all(states[s.key] for s in to_submit):
+                print("  all stream jobs are RUNNING")
                 return
-        if state is None and seen_running:
-            fail("stream job stopped shortly after start (check the Flink UI at :8081)")
+            fail("stream job(s) stopped shortly after start (check the Flink UI at :8081)")
         time.sleep(5)
-    fail("stream job did not reach RUNNING in time")
+    fail("stream job(s) did not reach RUNNING in time")
 
 
 def step_stream_catchup() -> None:
@@ -304,8 +319,8 @@ def main() -> None:
     print("  Dagster UI             : .venv/bin/dagster dev  -> http://localhost:3000")
     print("  Trino                  : localhost:8080 (user: admin, catalog: iceberg)")
     print("  MinIO console          : http://localhost:9001 (minioadmin / minioadmin)")
-    print("  Kafka                  : localhost:9092 (topic raw.web_events; live demo: make stream-up)")
-    print("  Flink                  : http://localhost:8081 (stream job -> iceberg.bronze.stream_web_events)")
+    print("  Kafka                  : localhost:9092 (4 topics: raw.web_events/orders/order_items/payments)")
+    print("  Flink                  : http://localhost:8081 (4 stream jobs -> iceberg.bronze.stream_*)")
     print(f"  Full DQ suite          : make verify-dq   (took {time.time() - t0:.0f}s total)")
     print("=" * 62)
 

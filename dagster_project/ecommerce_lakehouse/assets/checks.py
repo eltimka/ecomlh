@@ -54,6 +54,9 @@ DATA_DATE_START = date.fromisoformat(os.environ.get("DATA_DATE_START", "2024-01-
 DATA_DATE_END = date.fromisoformat(os.environ.get("DATA_DATE_END", "2024-12-31"))
 KAFKA_BOOTSTRAP = os.environ.get("KAFKA_BOOTSTRAP", "localhost:9092")
 KAFKA_TOPIC = os.environ.get("KAFKA_TOPIC", "raw.web_events")
+KAFKA_TOPIC_ORDERS = os.environ.get("KAFKA_TOPIC_ORDERS", "raw.orders")
+KAFKA_TOPIC_ORDER_ITEMS = os.environ.get("KAFKA_TOPIC_ORDER_ITEMS", "raw.order_items")
+KAFKA_TOPIC_PAYMENTS = os.environ.get("KAFKA_TOPIC_PAYMENTS", "raw.payments")
 # consumer_lag tolerance: a healthy Flink job commits within its 10s
 # checkpoint interval (a few hundred rows at the default 20 events/s live
 # rate); a stopped consumer drifts far past this within a minute.
@@ -260,6 +263,63 @@ SPECS.append({
     "condition": "info", "blocking": False,
 })
 
+# ---- Phase 15 item 4: money-path stream bronze (written by Flink) ----------
+_MONEY_STREAMS = [
+    # (table, pk, date_col or None, kafka topic)
+    ("stream_orders", "order_id", "order_date", KAFKA_TOPIC_ORDERS),
+    ("stream_order_items", "order_item_id", None, KAFKA_TOPIC_ORDER_ITEMS),
+    ("stream_payments", "payment_id", "payment_date", KAFKA_TOPIC_PAYMENTS),
+]
+for _tbl, _pk, _dcol, _topic in _MONEY_STREAMS:
+    SPECS.append({
+        "layer": "bronze", "table": _tbl, "name": f"{_pk}_unique",
+        "description": (
+            f"bronze.{_tbl}: {_pk} is unique (with Phase 15 durable restarts, "
+            "within-stream duplicates can only appear after an UNGRACEFUL kill "
+            "mid-checkpoint; silver's dedup absorbs them - surfaced here)"
+        ),
+        "sql": _unique_sql(f"{B}.{_tbl}", _pk), "condition": "zero", "blocking": False,
+    })
+    SPECS.append({
+        "layer": "bronze", "table": _tbl, "name": "consumer_lag",
+        "description": (
+            f"bronze.{_tbl} vs Kafka topic '{_topic}': committed rows are "
+            f"within +/-{LAG_TOLERANCE:,} of the topic end offset (a stopped "
+            "or stuck Flink consumer drifts past the tolerance)"
+        ),
+        "sql": _count_sql(f"{B}.{_tbl}"), "condition": "kafka_lag",
+        "topic": _topic, "lag_tolerance": LAG_TOLERANCE, "blocking": False,
+    })
+for _tbl, _dcol in (("stream_orders", "order_date"), ("stream_payments", "payment_date")):
+    SPECS.append({
+        "layer": "bronze", "table": _tbl, "name": "date_range",
+        "description": (
+            f"bronze.{_tbl}: {_dcol} starts within the history window "
+            f"(>= {DATA_DATE_START}) and reaches at least {DATA_DATE_END} "
+            "(live rows may extend it)"
+        ),
+        "sql": _range_sql(f"{B}.{_tbl}", _dcol),
+        "condition": "range_cover", "range_kind": "stream", "blocking": False,
+    })
+for _bt, _st, _col in (
+    ("orders", "stream_orders", "order_id"),
+    ("order_items", "stream_order_items", "order_item_id"),
+    ("payments", "stream_payments", "payment_id"),
+):
+    SPECS.append({
+        "layer": "bronze", "table": GATE_NAME, "name": f"{_bt}_cross_source_dups",
+        "description": (
+            f"bronze.{_bt} vs bronze.{_st}: {_col}s arriving via BOTH sources "
+            "(replay mode: the full history; live mode: the replayed prefix). "
+            "Informational - silver dedups them."
+        ),
+        "sql": (
+            f"SELECT count(*) FROM (SELECT {_col} FROM {B}.{_bt} "
+            f"INTERSECT SELECT {_col} FROM {B}.{_st}) d"
+        ),
+        "condition": "info", "blocking": False,
+    })
+
 # ---- silver ---------------------------------------------------------------
 for _t in _SV_UNIQUE:
     SPECS.append({
@@ -317,11 +377,12 @@ for _t, _n, _d, _sql in _SV_RULES:
 SPECS.append({
     "layer": "silver", "table": "fct_orders", "name": "date_range",
     "description": (
-        f"silver.fct_orders: order_date covers the expected data range "
-        f"({DATA_DATE_START} .. {DATA_DATE_END})"
+        f"silver.fct_orders: order_date (merged batch + stream) starts within "
+        f"the history window (>= {DATA_DATE_START}) and reaches at least "
+        f"{DATA_DATE_END} (live orders may extend it)"
     ),
     "sql": _range_sql(f"{S}.fct_orders", "order_date"),
-    "condition": "range_cover", "blocking": False,
+    "condition": "range_cover", "range_kind": "stream", "blocking": False,
 })
 
 # ---- Phase 13: silver merge of batch + stream web events ------------------
@@ -365,6 +426,62 @@ SPECS.append({
     ),
     "condition": "boolean_true", "blocking": False,
 })
+
+# ---- Phase 15 item 4: silver merge of batch + stream money path -----------
+SPECS.append({
+    "layer": "silver", "table": "fct_payments", "name": "date_range",
+    "description": (
+        f"silver.fct_payments: payment_date (merged batch + stream) starts "
+        f"within the history window (>= {DATA_DATE_START}) and reaches at "
+        f"least {DATA_DATE_END} (live rows may extend it)"
+    ),
+    "sql": _range_sql(f"{S}.fct_payments", "payment_date"),
+    "condition": "range_cover", "range_kind": "stream", "blocking": False,
+})
+SPECS.append({
+    "layer": "silver", "table": GATE_NAME, "name": "stream_orders_customers_fk",
+    "description": (
+        "bronze.stream_orders: every customer_id exists in silver.dim_customers"
+    ),
+    "sql": (
+        "SELECT count(*) FROM iceberg.bronze.stream_orders c "
+        "LEFT JOIN iceberg.silver.dim_customers p "
+        "ON p.customer_id = c.customer_id WHERE p.customer_id IS NULL"
+    ),
+    "condition": "zero", "blocking": False,
+})
+SPECS.append({
+    "layer": "silver", "table": GATE_NAME, "name": "stream_order_items_products_fk",
+    "description": (
+        "bronze.stream_order_items: every product_id exists in silver.dim_products"
+    ),
+    "sql": (
+        "SELECT count(*) FROM iceberg.bronze.stream_order_items c "
+        "LEFT JOIN iceberg.silver.dim_products p "
+        "ON p.product_id = c.product_id WHERE p.product_id IS NULL"
+    ),
+    "condition": "zero", "blocking": False,
+})
+for _silver, _batch, _stream, _col in (
+    ("fct_orders", "orders", "stream_orders", "order_id"),
+    ("fct_order_items", "order_items", "stream_order_items", "order_item_id"),
+    ("fct_payments", "payments", "stream_payments", "payment_id"),
+):
+    SPECS.append({
+        "layer": "silver", "table": GATE_NAME, "name": f"{_silver}_merge_reconcile",
+        "description": (
+            f"silver.{_silver}: row count equals the distinct {_col} across "
+            "both bronze sources. Exact while the topic is stable; with a "
+            "live producer rows can land between the CTAS and this check."
+        ),
+        "sql": (
+            f"SELECT (SELECT count(*) FROM {S}.{_silver}) "
+            f"= (SELECT count(DISTINCT {_col}) FROM "
+            f"(SELECT {_col} FROM {B}.{_batch} "
+            f"UNION ALL SELECT {_col} FROM {B}.{_stream}) u)"
+        ),
+        "condition": "boolean_true", "blocking": False,
+    })
 
 # ---- gold -----------------------------------------------------------------
 for _t in ("customer_360", "revenue_by_channel", "revenue_by_category", "monthly_kpis"):
@@ -439,8 +556,9 @@ SPECS += [
     {
         "layer": "gold", "table": "monthly_kpis", "name": "freshness",
         "description": (
-            f"gold.monthly_kpis: latest month is the data range end month "
-            f"({DATA_DATE_END.year}-{DATA_DATE_END.month:02d})"
+            f"gold.monthly_kpis: latest month is at least the data range end "
+            f"month ({DATA_DATE_END.year}-{DATA_DATE_END.month:02d}); a live "
+            "producer may push it further out"
         ),
         "sql": f"SELECT max(month) FROM {G}.monthly_kpis",
         "condition": "max_month", "blocking": False,
@@ -468,13 +586,16 @@ SPECS += [
     {
         "layer": "gold", "table": "monthly_kpis", "name": "monthly_anomaly",
         "description": (
-            "simple anomaly detection: no month's order count deviates > 3 sigma "
-            "from the yearly mean"
+            "simple anomaly detection over the historical months only "
+            f"(<= {DATA_DATE_END.year}-{DATA_DATE_END.month:02d}): no month's "
+            "order count deviates > 3 sigma from the mean. Any live tail month "
+            "is excluded - it is partial and would always look anomalous."
         ),
         "sql": (
             "SELECT coalesce(max(abs(z)), 0) FROM ("
             "SELECT (orders - avg(orders) OVER ()) / stddev(orders) OVER () AS z "
-            "FROM iceberg.gold.monthly_kpis) t"
+            f"FROM iceberg.gold.monthly_kpis "
+            f"WHERE month <= date '{date(DATA_DATE_END.year, DATA_DATE_END.month, 1).isoformat()}') t"
         ),
         "condition": "z_lt_3", "blocking": False,
     },
@@ -587,7 +708,7 @@ def _evaluate(spec: dict, row: tuple) -> tuple[bool, str]:
     if condition == "max_month":
         mx = row[0]
         expected = date(DATA_DATE_END.year, DATA_DATE_END.month, 1)
-        return mx == expected, f"latest month {mx} vs expected {expected}"
+        return mx >= expected, f"latest month {mx} >= {expected} (live-aware)"
     raise ValueError(f"Unknown check condition: {condition}")
 
 

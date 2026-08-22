@@ -37,7 +37,7 @@ gold_refresh = define_asset_job(
 lakehouse_refresh = define_asset_job(
     "lakehouse_refresh",
     selection=AssetSelection.all(),
-    description="Full lakehouse refresh: bronze -> silver -> gold + all 92 asset checks.",
+    description="Full lakehouse refresh: bronze -> silver -> gold + all 109 asset checks.",
 )
 
 definitions = Definitions(

@@ -56,28 +56,39 @@ reseed:
 	$(MAKE) refresh
 	$(MAKE) verify
 
-# job name of the Flink streaming job (see flink/sql/stream_web_events.sql)
-STREAM_JOB := insert-into_iceberg.bronze.stream_web_events
+# Flink streaming job names (derived by Flink from the INSERT statements in
+# flink/sql/*.sql): one job per topic, one per stream bronze table.
+STREAM_JOBS := \
+	insert-into_iceberg.bronze.stream_web_events \
+	insert-into_iceberg.bronze.stream_orders \
+	insert-into_iceberg.bronze.stream_order_items \
+	insert-into_iceberg.bronze.stream_payments
 
-## flink-up: submit the Kafka -> Iceberg stream job if it is not already running
+## flink-up: submit the Kafka -> Iceberg stream jobs that are not running yet
 flink-up:
-	@JID=$$(curl -s http://localhost:8081/jobs/overview 2>/dev/null | $(VENV)/python -c 'import json,sys; jobs=json.load(sys.stdin).get("jobs",[]); m=[j["jid"] for j in jobs if j["name"]=="'"$(STREAM_JOB)"'" and j["state"] in ("RUNNING","RESTARTING")]; print(m[0] if m else "")'); \
-	if [ -n "$$JID" ]; then \
-		echo "stream job already running ($$JID)"; \
-	else \
-		docker compose -f docker/docker-compose.yml exec -T flink-jobmanager \
-			./bin/sql-client.sh -f /opt/flink/sql/stream_web_events.sql; \
-		echo "stream job submitted"; \
-	fi
+	@for JOB in $(STREAM_JOBS); do \
+		JID=$$(JOB="$$JOB" curl -s http://localhost:8081/jobs/overview 2>/dev/null | JOB="$$JOB" $(VENV)/python -c 'import json,sys,os; jobs=json.load(sys.stdin).get("jobs",[]); n=os.environ["JOB"]; m=[j["jid"] for j in jobs if j["name"]==n and j["state"] in ("RUNNING","RESTARTING")]; print(m[0] if m else "")'); \
+		if [ -n "$$JID" ]; then \
+			echo "$$JOB: already running ($$JID)"; \
+		else \
+			echo "$$JOB: submitting ($${JOB##*.}.sql)"; \
+			docker compose -f docker/docker-compose.yml exec -T flink-jobmanager \
+				./bin/sql-client.sh -f /opt/flink/sql/$${JOB##*.}.sql || exit 1; \
+			echo "$$JOB: submitted"; \
+		fi; \
+	done
 
-## flink-down: cancel the Kafka -> Iceberg stream job (containers stay up)
+## flink-down: cancel the Kafka -> Iceberg stream jobs (containers stay up)
 flink-down:
-	@JID=$$(curl -s http://localhost:8081/jobs/overview 2>/dev/null | $(VENV)/python -c 'import json,sys; jobs=json.load(sys.stdin).get("jobs",[]); m=[j["jid"] for j in jobs if j["name"]=="'"$(STREAM_JOB)"'" and j["state"] in ("RUNNING","RESTARTING")]; print(m[0] if m else "")'); \
-	if [ -n "$$JID" ]; then \
-		docker exec flink-jobmanager ./bin/flink cancel $$JID; \
-	else \
-		echo "stream job not running"; \
-	fi
+	@for JOB in $(STREAM_JOBS); do \
+		JID=$$(JOB="$$JOB" curl -s http://localhost:8081/jobs/overview 2>/dev/null | JOB="$$JOB" $(VENV)/python -c 'import json,sys,os; jobs=json.load(sys.stdin).get("jobs",[]); n=os.environ["JOB"]; m=[j["jid"] for j in jobs if j["name"]==n and j["state"] in ("RUNNING","RESTARTING")]; print(m[0] if m else "")'); \
+		if [ -n "$$JID" ]; then \
+			echo "$$JOB: cancelling ($$JID)"; \
+			docker exec flink-jobmanager ./bin/flink cancel $$JID || exit 1; \
+		else \
+			echo "$$JOB: not running"; \
+		fi; \
+	done
 
 ## stream-up: start the live streaming producer in the background (demo mode;
 ##            replays the history, then emits new events on a simulated clock)

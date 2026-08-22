@@ -1,20 +1,18 @@
 #!/usr/bin/env python3
-"""Verify the Phase 12 streaming path (Flink -> Iceberg).
+"""Verify the Flink -> Iceberg streaming path (all four stream bronze tables).
 
-Checks (Flink + Trino must be up; run after `make run` or `make reseed`):
-  1. Flink REST is reachable and the stream job is RUNNING.
-  2. The Iceberg table has caught up with the topic (row count >= total
-     messages in raw.web_events). Polls for a while - the initial replay
-     takes a minute or two.
-  3. The job is committing: at least one checkpoint completed, none failed.
-     (Asserted AFTER catch-up: a freshly submitted job legitimately has
-     zero completed checkpoints until its first commit lands.)
-  4. No duplicate event_ids in the table (the table holds exactly one
-     replay; a stale job would show duplicates -> run `make reseed`).
-  5. Full coverage of the batch history: every history event_id is present
-     (distinct count >= history rows, first id == EVT-00000001).
+For every stream in stream_spec.STREAM_SPECS (web_events + the Phase 15 money
+path), run after `make run` or `make reseed`:
+   1. The Flink job is RUNNING.
+   2. The table has caught up with its topic (row count >= topic messages);
+      polls for a while - the initial replay takes a minute or two.
+   3. The job is committing: >= 1 checkpoint completed, none failed
+      (asserted AFTER catch-up: a fresh job legitimately has zero until its
+      first commit lands).
+   4. No duplicate primary keys in the table (one clean replay).
+   5. Full history coverage: distinct pk >= history rows, min pk == first_id.
 
-Exit code 0 + "RESULT: PASS" when everything is green.
+Exit code 0 + "RESULT: PASS" when every stream is green.
 """
 
 from __future__ import annotations
@@ -32,12 +30,10 @@ from dotenv import load_dotenv
 REPO_ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(REPO_ROOT / ".env")
 
+from stream_spec import STREAM_SPECS
+
 KAFKA_BOOTSTRAP = os.environ.get("KAFKA_BOOTSTRAP", "localhost:9092")
-KAFKA_TOPIC = os.environ.get("KAFKA_TOPIC", "raw.web_events")
 FLINK_REST = "http://localhost:8081"
-STREAM_JOB_NAME = "insert-into_iceberg.bronze.stream_web_events"
-TABLE = "iceberg.bronze.stream_web_events"
-HISTORY = REPO_ROOT / "data" / "synthetic" / "web_events.parquet"
 CATCHUP_DEADLINE_S = 180
 
 
@@ -46,9 +42,9 @@ def flink_rest(path: str) -> dict:
         return json.load(r)
 
 
-def stream_job() -> dict | None:
-    """The active stream job (RUNNING/RESTARTING), else the most recent entry."""
-    jobs = [j for j in flink_rest("/jobs/overview").get("jobs", []) if j["name"] == STREAM_JOB_NAME]
+def stream_job(name: str) -> dict | None:
+    """The active job for `name` (RUNNING/RESTARTING), else the most recent."""
+    jobs = [j for j in flink_rest("/jobs/overview").get("jobs", []) if j["name"] == name]
     if not jobs:
         return None
     for job in jobs:
@@ -72,15 +68,14 @@ def trino_query(sql: str):
     return rows
 
 
-def topic_message_count() -> int:
+def topic_message_count(topic: str) -> int:
     from kafka import KafkaConsumer
     from kafka import TopicPartition
 
     consumer = KafkaConsumer(bootstrap_servers=KAFKA_BOOTSTRAP)
     try:
-        partitions = [TopicPartition(KAFKA_TOPIC, p) for p in sorted(consumer.partitions_for_topic(KAFKA_TOPIC) or set())]
-        ends = consumer.end_offsets(partitions)
-        return sum(ends.values())
+        partitions = [TopicPartition(topic, p) for p in sorted(consumer.partitions_for_topic(topic) or set())]
+        return sum(consumer.end_offsets(partitions).values())
     finally:
         consumer.close()
 
@@ -93,93 +88,104 @@ def main() -> int:
         if not ok:
             failures.append(name)
 
-    print("Flink -> Iceberg streaming path verification (Phase 12)")
+    print(f"Flink -> Iceberg streaming path verification ({len(STREAM_SPECS)} streams)")
     print("=" * 60)
 
-    if not HISTORY.exists():
-        print(f"RESULT: FAIL - {HISTORY} missing (run generate_synthetic.py / make run first)")
-        return 1
-    n_hist = len(pl.read_parquet(HISTORY))
+    n_hist: dict[str, int] = {}
+    for spec in STREAM_SPECS:
+        if not spec.history.exists():
+            print(f"RESULT: FAIL - {spec.history} missing (run generate_synthetic.py / make run first)")
+            return 1
+        n_hist[spec.key] = len(pl.read_parquet(spec.history))
 
     # ------------------------------------------------------------------ 1.
-    print("[1] flink stream job")
+    print("[1] flink stream jobs")
     try:
-        job = stream_job()
+        job_by_key = {s.key: stream_job(s.job) for s in STREAM_SPECS}
     except Exception as exc:  # noqa: BLE001
         check("flink REST reachable", False, str(exc)[:120])
         print("=" * 60)
         print("RESULT: FAIL - flink not reachable")
         return 1
-    check(
-        "stream job is RUNNING",
-        job is not None and job["state"] == "RUNNING",
-        f"state={job['state'] if job else 'NOT SUBMITTED'}",
-    )
-    if job is None or job["state"] != "RUNNING":
+    for spec in STREAM_SPECS:
+        job = job_by_key[spec.key]
+        check(
+            f"{spec.key}: job RUNNING",
+            job is not None and job["state"] == "RUNNING",
+            f"state={job['state'] if job else 'NOT SUBMITTED'}",
+        )
+    not_running = [s.key for s in STREAM_SPECS if not (job_by_key[s.key] and job_by_key[s.key]["state"] == "RUNNING")]
+    if not_running:
         print("=" * 60)
-        print("RESULT: FAIL - stream job not running (make flink-up)")
+        print(f"RESULT: FAIL - stream job(s) not running: {not_running} (make flink-up)")
         return 1
 
     # ------------------------------------------------------------------ 2.
-    print("[2] catch-up with the topic")
-    try:
-        n_topic = topic_message_count()
-    except Exception as exc:  # noqa: BLE001
-        check("kafka reachable", False, str(exc)[:120])
-        n_topic = 0
-    n_rows = -1
+    print("[2] catch-up with the topics")
+    n_topic: dict[str, int] = {}
+    n_rows: dict[str, int] = {}
+    for spec in STREAM_SPECS:
+        n_topic[spec.key] = topic_message_count(spec.topic)
     t0 = time.time()
-    while time.time() - t0 < CATCHUP_DEADLINE_S:
-        try:
-            n_rows = trino_query(f"SELECT count(*) FROM {TABLE}")[0][0]
-        except Exception:  # noqa: BLE001
-            n_rows = 0
-        if n_rows >= n_topic:
-            break
-        time.sleep(5)
-    check(
-        f"table caught up with topic ({n_topic:,} messages)",
-        n_rows >= n_topic > 0,
-        f"table={n_rows:,} after {time.time() - t0:.0f}s",
-    )
+    pending = [s.key for s in STREAM_SPECS]
+    while pending and time.time() - t0 < CATCHUP_DEADLINE_S:
+        still_pending = []
+        for key in pending:
+            spec = next(s for s in STREAM_SPECS if s.key == key)
+            try:
+                n_rows[key] = trino_query(f"SELECT count(*) FROM {spec.table}")[0][0]
+            except Exception:  # noqa: BLE001
+                n_rows[key] = 0
+            if n_rows[key] < n_topic[key]:
+                still_pending.append(key)
+        pending = still_pending
+        if pending:
+            time.sleep(5)
+    for spec in STREAM_SPECS:
+        check(
+            f"{spec.key}: caught up with topic ({n_topic[spec.key]:,} msgs)",
+            n_rows.get(spec.key, 0) >= n_topic[spec.key] > 0,
+            f"table={n_rows.get(spec.key, 0):,} after {time.time() - t0:.0f}s",
+        )
 
     # ------------------------------------------------------------------ 3.
     print("[3] checkpoints")
-    counts = flink_rest(f"/jobs/{job['jid']}/checkpoints").get("counts", {})
-    check(
-        "at least one checkpoint completed",
-        counts.get("completed", 0) >= 1,
-        f"completed={counts.get('completed', 0)}",
-    )
-    check("no failed checkpoints", counts.get("failed", 0) == 0, f"failed={counts.get('failed', 0)}")
+    for spec in STREAM_SPECS:
+        counts = flink_rest(f"/jobs/{job_by_key[spec.key]['jid']}/checkpoints").get("counts", {})
+        check(
+            f"{spec.key}: >=1 checkpoint completed",
+            counts.get("completed", 0) >= 1,
+            f"completed={counts.get('completed', 0)}",
+        )
+        check(f"{spec.key}: no failed checkpoints", counts.get("failed", 0) == 0, f"failed={counts.get('failed', 0)}")
 
     # ------------------------------------------------------------------ 4.
     print("[4] no duplicates")
-    total, distinct = trino_query(
-        f"SELECT count(*), count(DISTINCT event_id) FROM {TABLE}"
-    )[0]
-    check(
-        "no duplicate event_ids (one clean replay)",
-        total == distinct,
-        f"rows={total:,} distinct={distinct:,}",
-    )
+    for spec in STREAM_SPECS:
+        total, distinct = trino_query(f"SELECT count(*), count(DISTINCT {spec.pk}) FROM {spec.table}")[0]
+        check(
+            f"{spec.key}: no duplicate {spec.pk} (one clean replay)",
+            total == distinct,
+            f"rows={total:,} distinct={distinct:,}",
+        )
 
     # ------------------------------------------------------------------ 5.
     print("[5] history coverage")
-    n_distinct = trino_query(f"SELECT count(DISTINCT event_id) FROM {TABLE}")[0][0]
-    first = trino_query(f"SELECT min(event_id) FROM {TABLE}")[0][0]
-    check(
-        f"all {n_hist:,} history events landed",
-        n_distinct >= n_hist,
-        f"distinct={n_distinct:,}",
-    )
-    check("first event_id == EVT-00000001", first == "EVT-00000001", f"min={first}")
+    for spec in STREAM_SPECS:
+        n_distinct = trino_query(f"SELECT count(DISTINCT {spec.pk}) FROM {spec.table}")[0][0]
+        first = trino_query(f"SELECT min({spec.pk}) FROM {spec.table}")[0][0]
+        check(
+            f"{spec.key}: all {n_hist[spec.key]:,} history rows landed",
+            n_distinct >= n_hist[spec.key],
+            f"distinct={n_distinct:,}",
+        )
+        check(f"{spec.key}: first {spec.pk} == {spec.first_id}", first == spec.first_id, f"min={first}")
 
     print("=" * 60)
     if failures:
         print(f"RESULT: FAIL - {len(failures)} check(s) failed: {failures}")
         return 1
-    print("RESULT: PASS - flink stream path verified (Kafka -> Iceberg, caught up, no dupes)")
+    print("RESULT: PASS - all flink stream paths verified (Kafka -> Iceberg, caught up, no dupes)")
     return 0
 
 

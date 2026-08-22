@@ -164,7 +164,9 @@ def main() -> int:
 
     # 4. monthly_kpis volume reconciliation
     kpi_months = scalar("SELECT count(DISTINCT month) FROM iceberg.gold.monthly_kpis")
-    check("monthly_kpis: covers 12 months", kpi_months == 12, f"{kpi_months} months")
+    # >= 12: the full 2024 history is present; a live producer adds tail months
+    check("monthly_kpis: covers the 12-month history (+ any live tail)",
+          kpi_months >= 12, f"{kpi_months} months")
     kpi_orders = scalar("SELECT sum(orders) FROM iceberg.gold.monthly_kpis")
     check("monthly_kpis: sum(orders) = silver orders",
           kpi_orders == orders_total, f"{kpi_orders:,} vs {orders_total:,}")

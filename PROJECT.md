@@ -45,15 +45,17 @@ Gold Customer 360 marts
         ↓
 Streamlit dashboard (live Trino queries, port 8501)
 
-Streaming path (planned, Phases 11+ - see build order):
+Streaming path (Phases 11-15 - DONE, see build order):
 stream_producer.py (seeded, simulated clock)
         ↓
-Kafka (topic: raw.web_events)
+Kafka (topics: raw.web_events, raw.orders, raw.order_items, raw.payments)
         ↓
-Flink (Kafka consumer → Iceberg append)
+Flink (4 dumb-append jobs: Kafka consumer → Iceberg)
         ↓
-bronze.stream_web_events ──▶ silver.fct_web_events merge
-                              (dedup on event_id) ──▶ gold
+bronze.stream_{web_events, orders, order_items, payments}
+        ↓
+silver.fct_{web_events, orders, order_items, payments} merges
+          (batch ∪ stream, dedup on PK; replay = zero delta) ──▶ gold
 ```
 
 ## Tech Stack (Locked)
@@ -69,8 +71,8 @@ bronze.stream_web_events ──▶ silver.fct_web_events merge
 | Transformations    | dbt-trino (preferred) or pure Trino SQL |                                 |
 | Data Quality       | dbt tests + Dagster asset checks |                                      |
 | Dashboard          | Streamlit + Plotly        | Thin local app querying Trino live (v1 was Superset, see notes) |
-| Streaming Bus      | Apache Kafka (KRaft, single node)    | Phase 11 done (web_events only in v1) |
-| Stream Processing  | Apache Flink + Iceberg Flink connector | Phase 12 done (Kafka → Iceberg append) |
+| Streaming Bus      | Apache Kafka (KRaft, single node)    | Phase 11+15: 4 topics (web_events + money path) |
+| Stream Processing  | Apache Flink + Iceberg Flink connector | 4 jobs (Kafka → Iceberg append, 8-slot TM) |
 | Language           | Python 3.11+                  |                                            |
 
 ## Project Structure (Target)
@@ -110,8 +112,12 @@ ecommerce-customer-360-lakehouse/
  ├── flink/                          # Phase 12
  │   ├── Dockerfile                  # flink + iceberg-flink + hive/hadoop clients + S3A
  │   ├── pom.xml                     # maven dependency closure for the image
- │   ├── hadoop/core-site.xml        # S3A/MinIO config (mounted, HADOOP_CONF_DIR)
- │   └── sql/stream_web_events.sql   # Flink SQL: Kafka → bronze.stream_web_events
+  │   ├── hadoop/core-site.xml        # S3A/MinIO config (mounted, HADOOP_CONF_DIR)
+  │   └── sql/                        # Flink SQL: 4 Kafka → Iceberg jobs
+  │       ├── stream_web_events.sql
+  │       ├── stream_orders.sql
+  │       ├── stream_order_items.sql
+  │       └── stream_payments.sql
 ├── dashboard/
 │   ├── app.py               # Streamlit dashboard (KPIs + 6 charts + profiles)
 │   └── marts.py             # the 11 gold-layer mart queries (single source of truth)
@@ -302,14 +308,17 @@ recorded in "Streaming design decisions" below.
 - Success criteria: `make run` end-to-end green + live demo works + all
   verify scripts PASS
 
-### Phase 15 (optional) – Hardening + Backlog
-(items 1-3 complete; item 4 left in the backlog as a future phase)
-- Flink checkpoints to S3 (durability across restarts)
-- Consumer-lag check in Dagster (on the virtual stream asset)
-- expire_snapshots / partition maintenance for the stream tables
-- Backlog: stream orders + payments (topics raw.orders / raw.payments,
-  merge into fct_orders / fct_payments) - same pattern as Phases 11-14,
-  higher business risk (money path)
+### Phase 15 – Hardening + Money-path streaming (ALL COMPLETE)
+- [x] Flink checkpoints to S3 (durability across restarts)
+- [x] Consumer-lag check in Dagster (on the virtual stream asset)
+- [x] expire_snapshots / partition maintenance for the stream tables
+- [x] **Stream the money path** (Phase 15 item 4): topics
+  `raw.orders` / `raw.order_items` / `raw.payments`, 3 new Flink jobs,
+  3 new stream bronze tables, silver merges batch ∪ stream into
+  `fct_orders` / `fct_order_items` / `fct_payments` (dedup on PK), live
+  order groups on a simulated clock (order + items + one payment, FK-valid,
+  cancelled ⇒ failed, no returned). Same pattern as Phases 11-14, applied
+  to the higher-risk money path. 92 → 109 checks, 25 → 28 assets.
 
 ## Streaming Design Decisions (Phase 11+)
 
@@ -317,8 +326,13 @@ recorded in "Streaming design decisions" below.
   real-time lakehouse; Trino's Kafka connector is batch-only and a
   scheduled INSERT...SELECT FROM kafka would be micro-batching, not
   streaming. Cost: +~3 GB RAM (Kafka + JM + TM) - document in README.
-- **web_events only in v1.** Append-only, no money path; orders/payments
-  deferred to the Phase 15 backlog.
+- **All 4 event types stream (Phase 15 item 4).** v1 was web_events only;
+  the money path (orders + order_items + payments) was added later with the
+  same pattern. order_items is REQUIRED, not optional: the blocking
+  `revenue_invariant` compares 5 views including the item-based
+  `revenue_by_category`, so live orders without items would break it and
+  halt gold. Live orders are completed/cancelled only (no `returned` —
+  refunds stay batch-only), cancelled ⇒ failed payment, total = Σ items.
 - **Separate stream bronze tables.** The batch full-refresh DROP+CTAS must
   never race with live appends (same class of race as the Phase 10
   layer-gate fix). Flink writes bronze.stream_web_events; silver merges.
@@ -376,14 +390,17 @@ generator, bronze layer ingestion, silver layer transformations, gold
 Customer 360 marts, data quality & observability, Streamlit dashboard
 (v1 Superset, superseded), polish & one-command startup, Kafka streaming bus
 + seeded producer, Flink -> Iceberg stream bronze, silver merge + DQ,
-live dashboard + ops, hardening).
+live dashboard + ops, hardening + money-path streaming).
 
-Phase 15 (hardening) complete: Flink checkpoints to S3 / durable restarts,
-non-blocking consumer-lag Dagster check, and snapshot + orphan-file
-maintenance (`make maintain`). Item 4 (stream orders + payments - the money
-path) was deliberately left in the backlog as a future phase (see the
-Phase 15 section, the "Phase 15 notes" entries and "Streaming design
-decisions" above).
+Phase 15 is fully complete, including item 4 (the money path): Flink
+checkpoints to S3 / durable restarts, non-blocking consumer-lag Dagster
+check, snapshot + orphan-file maintenance (`make maintain`), and streaming
+orders + order_items + payments (4 topics, 4 Flink jobs, 4 stream bronze
+tables, silver merges batch ∪ stream into the 3 money facts, live order
+groups on a simulated clock). 28 assets, 109 checks. The five-view revenue
+invariant holds with live money streaming (spread 0.0000). See the Phase 15
+section, the "Phase 15 notes" entries and "Streaming design decisions"
+above.
 
 Phase 11 notes (streaming bus: Kafka + seeded producer) - complete:
 - Compose: + `kafka` (apache/kafka:3.7.2, KRaft single node, 512M heap) with
@@ -733,8 +750,77 @@ Phase 15 notes - item 3 (snapshot + orphan-file maintenance) - complete:
 - Bug found while testing: dashboard live.py `flink_job_status()` picked the
   FIRST name-matching job from /jobs/overview, and after several reseed
   cycles the list holds stale CANCELED runs before the RUNNING one - the
-  live panel (and verify_dashboard) then reported state=CANCELED. Fixed to
-  prefer a RUNNING match.
+   live panel (and verify_dashboard) then reported state=CANCELED. Fixed to
+   prefer a RUNNING match.
+
+Phase 15 notes - item 4 (stream the money path) - complete:
+- Scope: 3 new Kafka topics (raw.orders / raw.order_items / raw.payments),
+  3 new Flink jobs, 3 new stream bronze tables (stream_orders /
+  stream_order_items / stream_payments), silver merges batch ∪ stream into
+  fct_orders / fct_order_items / fct_payments. order_items is REQUIRED: the
+  blocking revenue_invariant compares 5 views including the item-based
+  revenue_by_category, so live orders without items would break it and halt
+  gold. Refunds stay batch-only (live orders are never 'returned').
+- Producer (data_generator/stream_producer.py) generalized from 1 topic to
+  4, driven by a STREAMS list: replay emits all 4 Parquet histories (each
+  bit-identical to its file). Live mode interleaves the web-event stream
+  (20/s) and the live ORDER GROUPS (2/s) on one wall-clock timeline; each
+  group = 1 order + 1-5 items + exactly 1 payment sharing the same
+  simulated order_date. Determinism: SeedSequence([seed, 0x4C4F5244]); ids
+  continue the batch sequences (ORD-/OI-/PAY-), customer sampled from the
+  historical order-customer pool, product from the historical product pool
+  with the batch ±2% price jitter (FK-valid), total = Σ line_total,
+  cancelled ⇒ failed payment (else 97% succeeded / 3% pending), no returned.
+  --if-empty became per-topic. Bug found: live_order_stream needed the
+  products frame but main() only loaded the 4 stream Parquet files ->
+  KeyError 'products'; fixed by loading products.parquet in live mode.
+- Flink: 3 new SQL files (same DDL pattern as stream_web_events.sql:
+  group-offsets + earliest fallback, 10s S3 checkpoints). stream_order_items
+  is UNPARTITIONED (item rows carry no date column - one always-open write
+  partition, cheap on checkpoint memory); the other two partition by their
+  date column. Compose TM: 2 slots/4GB -> 8 slots/11GB so all 4 jobs'
+  (source + sink) tasks fit (each open parquet/zstd writer per date
+  partition is the memory driver).
+- kafka-init now loops over the 4 topics (GOTCHA: the shell var must be
+  escaped as $$t in compose, or compose interpolates it to empty and
+  kafka-topics.sh fails with "topic name '' cannot be represented").
+- scripts/stream_spec.py: new single source of truth (topic / flink job
+  name / stream table / history parquet / PK / first id per stream) shared
+  by reset_stream.py, verify_stream.py and verify_kafka.py - all three
+  generalized from 1 to 4 streams. Makefile flink-up/down loop over the 4
+  job names (job name -> sql file via ${JOB##*.}.sql).
+- Silver (assets/silver/sql.py): the 3 money facts now CTE-merge batch ∪
+  stream (ROW_NUMBER PARTITION BY pk ORDER BY src_rank, batch wins) before
+  the existing joins/enrichment; fct_orders aggregates item counts across
+  BOTH item sources; fct_payments dedups batch-wins-then-lowest-payment_id.
+  pre/post stats gained stream_rows / duplicates_dropped. fct_refunds stays
+  batch-only.
+- Dagster (assets/bronze/__init__.py): the hardcoded web_events virtual
+  asset became a _stream_asset(name, pk, date_col) factory; 4 virtual
+  stream assets registered (assets 25 -> 28).
+- DQ (assets/checks.py): 92 -> 109 checks. New: per-stream <pk>_unique +
+  consumer_lag (3) + date_range (2) + <t>_cross_source_dups (3) on bronze;
+  per-fact <fct>_merge_reconcile (3) + stream FKs (2) + fct_payments
+  date_range (1) on silver. Live-aware: fct_orders.date_range full ->
+  stream kind; gold freshness max_month == -> >= (live tail months allowed);
+  monthly_anomaly now computes z over historical months only (WHERE month
+  <= end-month) - a partial live tail month would always look anomalous.
+- Verify scripts made live/money-aware: verify_kafka (4 topics),
+  verify_stream (4 jobs/tables), verify_silver (union-based expected for all
+  4 merged facts + per-stream live detection + bounds; GMV check now
+  merged-bronze vs silver - batch-only bronze vs merged silver was the
+  exact live delta), verify_gold (12 -> >=12 months), verify_dashboard
+  (orders == -> >= manifest; 12 -> >=12 trend months).
+- Dashboard: live.py flink_job_status()/kafka_topic_end_offset() take a
+  job/topic argument; new latest_orders() + money_stream_summary(); the Live
+  view gains a money-path section (per-stream table: job state, Kafka end
+  offset, committed, uncommitted; + latest-15 orders dataframe).
+- Verified: `make reseed SEED=42` from clean state (reset 4 topics, 4
+  rebuilt tables, 4 jobs caught up, canonical 50,000 orders, `make verify`
+  7/7); live mode (8 live order groups -> Kafka -> Flink -> 4 stream tables
+  -> silver fct_orders 50,008 -> gold, revenue_invariant spread 0.0000
+  across all 5 views, `make verify` 7/7); 109/109 checks + 28 assets
+  (verify_dq constants).
 
 Phase 9 notes (v2: Streamlit - final dashboard):
 - dashboard/marts.py = the 11 gold-layer mart queries (single source of

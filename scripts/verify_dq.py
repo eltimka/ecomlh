@@ -35,8 +35,8 @@ from dagster._core.storage.asset_check_execution_record import (  # noqa: E402
 from ecommerce_lakehouse.assets import checks as checks_mod  # noqa: E402
 from ecommerce_lakehouse.definitions import definitions  # noqa: E402
 
-EXPECTED_ASSETS = 25  # 22 tables + 3 per-layer gate (barrier) assets
-EXPECTED_CHECKS = 92
+EXPECTED_ASSETS = 28  # 25 tables (21 marts/dims + 4 stream virtuals) + 3 per-layer gate (barrier) assets
+EXPECTED_CHECKS = 109
 
 
 def main() -> int:

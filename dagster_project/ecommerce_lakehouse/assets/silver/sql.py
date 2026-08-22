@@ -138,14 +138,65 @@ SILVER_SPECS: list[dict] = [
     {
         "name": "fct_orders",
         "table": "iceberg.silver.fct_orders",
-        "deps": ["orders", "customers", "order_items", "payments"],
+        "deps": [
+            "orders", "customers", "order_items", "payments",
+            "stream_orders", "stream_order_items", "stream_payments",
+        ],
         "description": (
-            "Order fact: one row per order, validated against the customer "
-            "dimension (orphans dropped), enriched with item counts, status "
-            "flags and a payment-consistency flag (cancelled <=> failed)."
+            "Order fact: batch + stream sources UNIONed and deduped on "
+            "order_id (batch wins - identical payload per order_id, no "
+            "arrival timestamp, so the source rank only makes the dedup "
+            "deterministic). One row per order, validated against the "
+            "customer dimension (orphans dropped), enriched with item "
+            "counts (across both item sources), status flags and a "
+            "payment-consistency flag (cancelled <=> failed)."
         ),
         "ctas": """
             CREATE TABLE iceberg.silver.fct_orders {location_props} AS
+            WITH orders_merged AS (
+                SELECT order_id, customer_id, order_date, order_status, channel, total_amount
+                FROM (
+                    SELECT order_id, customer_id, order_date, order_status, channel, total_amount,
+                           row_number() OVER (PARTITION BY order_id ORDER BY src_rank) AS rn
+                    FROM (
+                        SELECT order_id, customer_id, order_date, order_status, channel,
+                               total_amount, 1 AS src_rank
+                        FROM iceberg.bronze.orders
+                        UNION ALL
+                        SELECT order_id, customer_id, order_date, order_status, channel,
+                               total_amount, 2 AS src_rank
+                        FROM iceberg.bronze.stream_orders
+                    ) sources
+                ) ranked
+                WHERE rn = 1
+            ),
+            items_agg AS (
+                SELECT order_id,
+                       count(*)                   AS item_count,
+                       count(DISTINCT product_id) AS distinct_products
+                FROM (
+                    SELECT order_id, product_id FROM iceberg.bronze.order_items
+                    UNION ALL
+                    SELECT order_id, product_id FROM iceberg.bronze.stream_order_items
+                ) ui
+                GROUP BY order_id
+            ),
+            pay_merged AS (
+                SELECT order_id, payment_status
+                FROM (
+                    SELECT order_id, lower(trim(payment_status)) AS payment_status,
+                           row_number() OVER (PARTITION BY order_id
+                                              ORDER BY src_rank, payment_id) AS rn
+                    FROM (
+                        SELECT order_id, payment_id, payment_status, 1 AS src_rank
+                        FROM iceberg.bronze.payments
+                        UNION ALL
+                        SELECT order_id, payment_id, payment_status, 2 AS src_rank
+                        FROM iceberg.bronze.stream_payments
+                    ) sources
+                ) ranked
+                WHERE rn = 1
+            )
             SELECT o.order_id,
                    o.customer_id,
                    o.order_date,
@@ -161,33 +212,19 @@ SILVER_SPECS: list[dict] = [
                    p.payment_status = 'succeeded'          AS is_payment_succeeded,
                    (lower(trim(o.order_status)) = 'cancelled')
                        <> (p.payment_status = 'failed')    AS payment_status_conflict
-            FROM iceberg.bronze.orders o
+            FROM orders_merged o
             JOIN iceberg.bronze.customers c
                  ON c.customer_id = o.customer_id
-            LEFT JOIN (
-                SELECT order_id,
-                       count(*)                   AS item_count,
-                       count(DISTINCT product_id) AS distinct_products
-                FROM iceberg.bronze.order_items
-                GROUP BY order_id
-            ) it ON it.order_id = o.order_id
-            LEFT JOIN (
-                SELECT order_id, lower(trim(payment_status)) AS payment_status
-                FROM (
-                    SELECT payment_id, order_id, payment_status,
-                           row_number() OVER (
-                               PARTITION BY order_id ORDER BY payment_id
-                           ) AS rn
-                    FROM iceberg.bronze.payments
-                ) p
-                WHERE rn = 1
-            ) p ON p.order_id = o.order_id
+            LEFT JOIN items_agg it ON it.order_id = o.order_id
+            LEFT JOIN pay_merged p ON p.order_id = o.order_id
         """,
         "pre_stats": [
             ("bronze_rows", "SELECT count(*) FROM iceberg.bronze.orders"),
+            ("stream_rows", "SELECT count(*) FROM iceberg.bronze.stream_orders"),
             (
                 "orphan_orders",
-                "SELECT count(*) FROM iceberg.bronze.orders o "
+                "SELECT count(*) FROM (SELECT customer_id FROM iceberg.bronze.orders "
+                "UNION ALL SELECT customer_id FROM iceberg.bronze.stream_orders) o "
                 "LEFT JOIN iceberg.bronze.customers c "
                 "       ON c.customer_id = o.customer_id "
                 "WHERE c.customer_id IS NULL",
@@ -204,20 +241,56 @@ SILVER_SPECS: list[dict] = [
                 "SELECT count(*) FROM iceberg.silver.fct_orders "
                 "WHERE has_payment = false",
             ),
+            (
+                "duplicates_dropped",
+                "SELECT (SELECT count(*) FROM iceberg.bronze.orders) "
+                "+ (SELECT count(*) FROM iceberg.bronze.stream_orders) "
+                "- (SELECT count(*) FROM iceberg.silver.fct_orders)",
+            ),
         ],
     },
     {
         "name": "fct_order_items",
         "table": "iceberg.silver.fct_order_items",
-        "deps": ["order_items", "orders"],
+        "deps": ["order_items", "orders", "stream_order_items", "stream_orders"],
         "local_deps": ["dim_products"],
         "description": (
-            "Order-item fact: validated against orders and dim_products "
-            "(orphans dropped), DECIMAL money, denormalized product "
-            "attributes, and a qty*price vs line_total integrity flag."
+            "Order-item fact: batch + stream sources UNIONed and deduped on "
+            "order_item_id (batch wins), validated against the merged "
+            "orders and dim_products (orphans dropped), DECIMAL money, "
+            "denormalized product attributes, and a qty*price vs line_total "
+            "integrity flag."
         ),
         "ctas": """
             CREATE TABLE iceberg.silver.fct_order_items {location_props} AS
+            WITH items_merged AS (
+                SELECT order_item_id, order_id, product_id, quantity, unit_price, line_total
+                FROM (
+                    SELECT order_item_id, order_id, product_id, quantity, unit_price,
+                           line_total,
+                           row_number() OVER (PARTITION BY order_item_id
+                                              ORDER BY src_rank) AS rn
+                    FROM (
+                        SELECT order_item_id, order_id, product_id, quantity, unit_price,
+                               line_total, 1 AS src_rank
+                        FROM iceberg.bronze.order_items
+                        UNION ALL
+                        SELECT order_item_id, order_id, product_id, quantity, unit_price,
+                               line_total, 2 AS src_rank
+                        FROM iceberg.bronze.stream_order_items
+                    ) sources
+                ) ranked
+                WHERE rn = 1
+            ),
+            orders_merged AS (
+                SELECT order_id
+                FROM (
+                    SELECT order_id, 1 AS src_rank FROM iceberg.bronze.orders
+                    UNION ALL
+                    SELECT order_id, 2 AS src_rank FROM iceberg.bronze.stream_orders
+                ) sources
+                GROUP BY order_id
+            )
             SELECT i.order_item_id,
                    i.order_id,
                    i.product_id,
@@ -230,18 +303,23 @@ SILVER_SPECS: list[dict] = [
                    CAST(i.quantity * i.unit_price AS DECIMAL(12, 2))
                        <> CAST(i.line_total AS DECIMAL(12, 2))
                                                                   AS line_total_mismatch
-            FROM iceberg.bronze.order_items i
-            JOIN iceberg.bronze.orders o
+            FROM items_merged i
+            JOIN orders_merged o
                  ON o.order_id = i.order_id
             JOIN iceberg.silver.dim_products p
                  ON p.product_id = i.product_id
         """,
         "pre_stats": [
             ("bronze_rows", "SELECT count(*) FROM iceberg.bronze.order_items"),
+            ("stream_rows", "SELECT count(*) FROM iceberg.bronze.stream_order_items"),
             (
                 "orphan_items",
-                "SELECT count(*) FROM iceberg.bronze.order_items i "
-                "WHERE NOT EXISTS (SELECT 1 FROM iceberg.bronze.orders o "
+                "SELECT count(*) FROM (SELECT order_id, product_id "
+                "FROM iceberg.bronze.order_items "
+                "UNION ALL SELECT order_id, product_id "
+                "FROM iceberg.bronze.stream_order_items) i "
+                "WHERE NOT EXISTS (SELECT 1 FROM (SELECT order_id FROM iceberg.bronze.orders "
+                "                              UNION ALL SELECT order_id FROM iceberg.bronze.stream_orders) o "
                 "                   WHERE o.order_id = i.order_id) "
                 "   OR NOT EXISTS (SELECT 1 FROM iceberg.bronze.products p "
                 "                   WHERE p.product_id = i.product_id)",
@@ -253,19 +331,62 @@ SILVER_SPECS: list[dict] = [
                 "SELECT count(*) FROM iceberg.silver.fct_order_items "
                 "WHERE line_total_mismatch",
             ),
+            (
+                "duplicates_dropped",
+                "SELECT (SELECT count(*) FROM iceberg.bronze.order_items) "
+                "+ (SELECT count(*) FROM iceberg.bronze.stream_order_items) "
+                "- (SELECT count(*) FROM iceberg.silver.fct_order_items)",
+            ),
         ],
     },
     {
         "name": "fct_payments",
         "table": "iceberg.silver.fct_payments",
-        "deps": ["payments", "orders"],
+        "deps": ["payments", "orders", "stream_payments", "stream_orders"],
         "description": (
-            "Payment fact: deduplicated to one row per order (latest payment "
-            "id), validated against orders, DECIMAL amounts, status flags and "
-            "an amount-vs-order-total mismatch flag."
+            "Payment fact: batch + stream sources UNIONed, deduplicated to "
+            "one row per order (batch wins, then lowest payment_id), "
+            "validated against the merged orders, DECIMAL amounts, status "
+            "flags and an amount-vs-order-total mismatch flag."
         ),
         "ctas": """
             CREATE TABLE iceberg.silver.fct_payments {location_props} AS
+            WITH payments_merged AS (
+                SELECT payment_id, order_id, payment_method, payment_status,
+                       payment_date, amount
+                FROM (
+                    SELECT payment_id, order_id, payment_method, payment_status,
+                           payment_date, amount,
+                           row_number() OVER (PARTITION BY order_id
+                                              ORDER BY src_rank, payment_id) AS rn
+                    FROM (
+                        SELECT payment_id, order_id, payment_method, payment_status,
+                               payment_date, amount, 1 AS src_rank
+                        FROM iceberg.bronze.payments
+                        UNION ALL
+                        SELECT payment_id, order_id, payment_method, payment_status,
+                               payment_date, amount, 2 AS src_rank
+                        FROM iceberg.bronze.stream_payments
+                    ) sources
+                ) ranked
+                WHERE rn = 1
+            ),
+            orders_merged AS (
+                SELECT order_id, customer_id, total_amount
+                FROM (
+                    SELECT order_id, customer_id, total_amount,
+                           row_number() OVER (PARTITION BY order_id
+                                              ORDER BY src_rank) AS rn
+                    FROM (
+                        SELECT order_id, customer_id, total_amount, 1 AS src_rank
+                        FROM iceberg.bronze.orders
+                        UNION ALL
+                        SELECT order_id, customer_id, total_amount, 2 AS src_rank
+                        FROM iceberg.bronze.stream_orders
+                    ) sources
+                ) ranked
+                WHERE rn = 1
+            )
             SELECT p.payment_id,
                    p.order_id,
                    o.customer_id,
@@ -279,27 +400,27 @@ SILVER_SPECS: list[dict] = [
                    CAST(p.amount AS DECIMAL(12, 2))
                        <> CAST(o.total_amount AS DECIMAL(12, 2))
                                                                   AS amount_mismatch
-            FROM (
-                SELECT payment_id, order_id, payment_method, payment_status,
-                       payment_date, amount,
-                       row_number() OVER (
-                           PARTITION BY order_id ORDER BY payment_id
-                       ) AS rn
-                FROM iceberg.bronze.payments
-            ) p
-            JOIN iceberg.bronze.orders o
+            FROM payments_merged p
+            JOIN orders_merged o
                  ON o.order_id = p.order_id
-            WHERE p.rn = 1
         """,
         "pre_stats": [
             ("bronze_rows", "SELECT count(*) FROM iceberg.bronze.payments"),
+            ("stream_rows", "SELECT count(*) FROM iceberg.bronze.stream_payments"),
             (
                 "duplicate_payments",
-                "SELECT count(*) - count(DISTINCT order_id) "
-                "FROM iceberg.bronze.payments",
+                "SELECT count(*) - count(DISTINCT order_id) FROM (SELECT order_id "
+                "FROM iceberg.bronze.payments "
+                "UNION ALL SELECT order_id FROM iceberg.bronze.stream_payments) pp",
             ),
         ],
         "post_stats": [
+            (
+                "duplicates_dropped",
+                "SELECT (SELECT count(*) FROM iceberg.bronze.payments) "
+                "+ (SELECT count(*) FROM iceberg.bronze.stream_payments) "
+                "- (SELECT count(*) FROM iceberg.silver.fct_payments)",
+            ),
             (
                 "amount_mismatches",
                 "SELECT count(*) FROM iceberg.silver.fct_payments "

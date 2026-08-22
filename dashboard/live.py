@@ -30,6 +30,13 @@ STREAM_JOB_PREFIX = "insert-into_iceberg.bronze.stream_web_events"
 STREAM_TABLE = "iceberg.bronze.stream_web_events"
 LATEST_LIMIT = 15
 
+# (key, kafka topic, flink job name) for the Phase 15 money path
+MONEY_STREAMS = [
+    ("orders", "raw.orders", "insert-into_iceberg.bronze.stream_orders"),
+    ("order_items", "raw.order_items", "insert-into_iceberg.bronze.stream_order_items"),
+    ("payments", "raw.payments", "insert-into_iceberg.bronze.stream_payments"),
+]
+
 
 def _trino(sql: str) -> pd.DataFrame:
     con = trino.dbapi.connect(
@@ -46,14 +53,14 @@ def _trino(sql: str) -> pd.DataFrame:
         con.close()
 
 
-def flink_job_status() -> dict:
-    """State + checkpoint progress of the Kafka -> Iceberg Flink job."""
+def flink_job_status(job_prefix: str = STREAM_JOB_PREFIX) -> dict:
+    """State + checkpoint progress of one Kafka -> Iceberg Flink job."""
     try:
         import requests
 
         r = requests.get(f"{FLINK_REST}/jobs/overview", timeout=5)
         r.raise_for_status()
-        jobs = [j for j in r.json().get("jobs", []) if j.get("name", "").startswith(STREAM_JOB_PREFIX)]
+        jobs = [j for j in r.json().get("jobs", []) if j.get("name", "").startswith(job_prefix)]
         if not jobs:
             return {"found": False, "state": "not running"}
         # Flink lists jobs oldest-ish first; after reseeds the list holds
@@ -72,8 +79,8 @@ def flink_job_status() -> dict:
         return {"found": False, "state": "unreachable", "error": str(exc)[:160]}
 
 
-def kafka_topic_end_offset() -> dict:
-    """Sum of end offsets over all partitions of the raw topic."""
+def kafka_topic_end_offset(topic: str = KAFKA_TOPIC) -> dict:
+    """Sum of end offsets over all partitions of a raw topic."""
     try:
         from kafka import KafkaConsumer
         from kafka.structs import TopicPartition
@@ -84,10 +91,10 @@ def kafka_topic_end_offset() -> dict:
             request_timeout_ms=8000,
         )
         try:
-            parts = consumer.partitions_for_topic(KAFKA_TOPIC) or set()
+            parts = consumer.partitions_for_topic(topic) or set()
             if not parts:
-                return {"ok": False, "error": f"topic '{KAFKA_TOPIC}' not found"}
-            tps = [TopicPartition(KAFKA_TOPIC, p) for p in parts]
+                return {"ok": False, "error": f"topic '{topic}' not found"}
+            tps = [TopicPartition(topic, p) for p in parts]
             end = consumer.end_offsets(tps)
             return {"ok": True, "end_offset": sum(end.values()), "partitions": len(parts)}
         finally:
@@ -124,3 +131,33 @@ def stream_counts() -> dict:
 def latest_events(limit: int = LATEST_LIMIT) -> pd.DataFrame:
     """Newest events in the stream bronze (event_id sequence = arrival order)."""
     return _trino(f"SELECT * FROM {STREAM_TABLE} ORDER BY event_id DESC LIMIT {int(limit)}")
+
+
+def latest_orders(limit: int = LATEST_LIMIT) -> pd.DataFrame:
+    """Newest orders in the money stream bronze (order_id = arrival order)."""
+    return _trino(
+        f"SELECT order_id, customer_id, order_date, order_status, channel, total_amount "
+        f"FROM iceberg.bronze.stream_orders ORDER BY order_id DESC LIMIT {int(limit)}"
+    )
+
+
+def money_stream_summary() -> dict:
+    """Per-money-stream state: committed rows, kafka end offset, job state.
+
+    Degrades gracefully per-stream - a missing table or down broker yields an
+    ``error``/None for that stream without failing the whole summary.
+    """
+    out: dict = {"ok": True, "streams": {}}
+    for key, topic, job in MONEY_STREAMS:
+        table = f"iceberg.bronze.stream_{key}"
+        entry: dict = {"key": key}
+        try:
+            (rows,) = _trino(f"SELECT count(*) FROM {table}").iloc[0].tolist()
+            entry["stream_rows"] = int(rows)
+        except Exception as exc:  # noqa: BLE001 - table may not exist yet
+            entry["error"] = str(exc)[:120]
+        off = kafka_topic_end_offset(topic)
+        entry["kafka_end"] = off.get("end_offset") if off.get("ok") else None
+        entry["job_state"] = flink_job_status(job).get("state")
+        out["streams"][key] = entry
+    return out
