@@ -226,7 +226,7 @@ def main() -> int:
     )
 
     # ------------------------------------------------------------------ 3.
-    print("[3] Full lakehouse_refresh run (25 assets + all asset checks)")
+    print(f"[3] Full lakehouse_refresh run ({EXPECTED_ASSETS} assets + all asset checks)")
     home2 = tempfile.mkdtemp(prefix="dq_full_")
     storage2 = os.path.join(home2, "storage")
     os.makedirs(storage2)

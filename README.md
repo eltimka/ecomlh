@@ -78,7 +78,7 @@ and visualized in a local **Streamlit** dashboard.
 
 | Layer   | Tables                                                        |
 |---------|---------------------------------------------------------------|
-| Bronze  | 8 raw landing tables (customers, orders, order_items, payments, refunds, web_events, products, support_tickets) |
+| Bronze  | 8 raw landing tables (customers, orders, order_items, payments, refunds, web_events, products, support_tickets) + 4 stream tables written by Flink (stream_web_events, stream_orders, stream_order_items, stream_payments) |
 | Silver  | 3 dimensions (customers, products, order_dates) + 6 conformed facts |
 | Gold    | `customer_360` (LTV, RFM, churn), `revenue_by_channel`, `revenue_by_category`, `monthly_kpis` |
 
