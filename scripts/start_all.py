@@ -149,10 +149,13 @@ def flink_job_states() -> dict[str, str | None]:
             jobs = json.load(r)["jobs"]
     except Exception:
         return {s.key: None for s in STREAM_SPECS}
-    states = {j["name"]: j["state"] for j in jobs}
+    # A job name can appear more than once (e.g. after a cancel + resubmit);
+    # only the active instance counts - a stale terminal entry must not mask
+    # the running one (or start_all would resubmit and double-write the table).
+    states = {j["name"]: j["state"] for j in jobs if j["state"] in ("RUNNING", "RESTARTING")}
     out = {}
     for s in STREAM_SPECS:
-        out[s.key] = states[s.job] if states[s.job] in ("RUNNING", "RESTARTING") else None
+        out[s.key] = states.get(s.job)
     return out
 
 

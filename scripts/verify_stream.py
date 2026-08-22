@@ -151,13 +151,34 @@ def main() -> int:
     # ------------------------------------------------------------------ 3.
     print("[3] checkpoints")
     for spec in STREAM_SPECS:
-        counts = flink_rest(f"/jobs/{job_by_key[spec.key]['jid']}/checkpoints").get("counts", {})
+        cp = flink_rest(f"/jobs/{job_by_key[spec.key]['jid']}/checkpoints")
+        counts = cp.get("counts", {})
         check(
             f"{spec.key}: >=1 checkpoint completed",
             counts.get("completed", 0) >= 1,
             f"completed={counts.get('completed', 0)}",
         )
-        check(f"{spec.key}: no failed checkpoints", counts.get("failed", 0) == 0, f"failed={counts.get('failed', 0)}")
+        # Flink's lifetime `failed` counter also counts checkpoints that are
+        # aborted at trigger time while a task is still starting ("Not all
+        # required tasks are currently running") - a benign startup race that
+        # taints the counter for the job's whole lifetime. So instead of
+        # asserting failed == 0, assert that every checkpoint AFTER the first
+        # COMPLETED one is also clean: a failure before the first successful
+        # commit is the known startup window, a failure after it is a real
+        # regression (and would usually also show up as consumer lag).
+        hist = cp.get("history", []) or []
+        first_ok = next((c["id"] for c in hist if c.get("status") == "COMPLETED"), None)
+        dirty = [
+            f"#{c.get('id')}={c.get('status')}"
+            for c in hist
+            if c.get("status") in ("FAILED", "EXPIRED") and first_ok is not None and c.get("id", 0) > first_ok
+        ]
+        check(
+            f"{spec.key}: checkpoints clean after first commit",
+            first_ok is not None and not dirty,
+            f"last {len(hist)} shown, lifetime failed={counts.get('failed', 0)}"
+            + (f" (post-commit failures: {'; '.join(dirty)})" if dirty else ""),
+        )
 
     # ------------------------------------------------------------------ 4.
     print("[4] no duplicates")
