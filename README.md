@@ -2,7 +2,8 @@
 
 A production-style **Customer 360 data pipeline** that runs entirely on your
 laptop. Synthetic e-commerce data flows through a **Medallion lakehouse**
-(Bronze → Silver → Gold) on **Apache Iceberg** in **MinIO**, orchestrated by
+(Bronze → Silver → Gold) on **Apache Iceberg** in **Garage** (S3-compatible),
+orchestrated by
 **Dagster** (with 109 declarative data-quality checks), queried by **Trino**,
 and visualized in a local **Streamlit** dashboard.
 
@@ -55,7 +56,7 @@ and visualized in a local **Streamlit** dashboard.
   └────────────────────────────┼────────────────────────────────────┘
                                ▼
         ┌─────────────────────────────────────────────┐
-        │        Apache Iceberg on MinIO (S3)         │
+        │       Apache Iceberg on Garage (S3)         │
         │  bronze/  silver/  gold/   (3 buckets)      │
         └─────────────────────────────────────────────┘
                                ▲
@@ -87,7 +88,7 @@ and visualized in a local **Streamlit** dashboard.
 | Component          | Tool                          |
 |--------------------|-------------------------------|
 | Orchestration      | Dagster (assets, checks, jobs) |
-| Object storage     | MinIO (S3-compatible)          |
+| Object storage     | Garage (S3-compatible)         |
 | Table format       | Apache Iceberg                 |
 | Metastore          | Hive Metastore + Postgres      |
 | Query engine       | Trino 483                      |
@@ -110,7 +111,7 @@ Elvira_Project/
 │   └── ecommerce_lakehouse/
 │       ├── definitions.py     # assets, checks, 4 refresh jobs
 │       ├── assets/            # bronze / silver / gold + checks.py + factory
-│       └── resources/         # TrinoResource, MinioResource
+│       └── resources/         # TrinoResource, S3StorageResource
 ├── data_generator/            # seeded synthetic data generator + Kafka producer
 ├── flink/                     # custom Flink image + Kafka → Iceberg stream job
 ├── dashboard/                 # Streamlit dashboard (app.py + marts.py SQL)
@@ -135,7 +136,8 @@ cp .env.example .env          # all defaults work out of the box
 make run
 ```
 
-`make run` brings up the stack, generates data if missing, bootstraps MinIO,
+`make run` brings up the stack, generates data if missing, bootstraps Garage
+buckets + Trino schemas,
 replays the seeded history of all 4 topics into Kafka, submits the 4 Flink
 jobs that append the topics into Iceberg, starts the dashboard, runs the
 full `lakehouse_refresh` job (28 assets + 109 checks), and finishes with the
@@ -146,7 +148,7 @@ quick verification suite. Then:
 | http://localhost:8501               | "Customer 360" dashboard: KPIs, LTV distribution, churn/RFM mixes, revenue trend, channel/category, customer profiles. **Interactive**: order-channel / acquisition-channel / churn-risk / month-range filters + customer search - every change re-queries Trino |
 | `make dev` → http://localhost:3000  | Dagster: asset graph, runs, 109 check results                   |
 | http://localhost:8081               | Flink: 4 stream jobs RUNNING, clean checkpoints |
-| http://localhost:9001 (minioadmin/minioadmin) | bronze/silver/gold buckets with Iceberg metadata/data |
+| http://localhost:3903 (admin API) | bronze/silver/gold buckets (token in docker/garage/garage.toml) |
 
 ### Manual steps (what `make run` does)
 
@@ -169,7 +171,7 @@ cd ..   # bronze→silver→gold + 109 checks
 |-----------------|-----------------------------------------------------------------|
 | `make run`      | one-command end-to-end startup (idempotent)                     |
 | `make up` / `down` | start / stop the Docker stack + dashboard (data kept)       |
-| `make bootstrap`  | MinIO buckets + Trino schemas (idempotent)                     |
+| `make bootstrap`  | Garage buckets + Trino schemas (idempotent)                    |
 | `make refresh`    | re-run the whole pipeline with all checks                      |
 | `make dev`        | Dagster UI on :3000                                            |
 | `make dashboard`  | Streamlit Customer 360 dashboard on :8501 (foreground)         |
@@ -208,7 +210,7 @@ Each layer has a persistent verification script; all print `RESULT: PASS`:
 
 | Script                    | Proves                                                              |
 |---------------------------|---------------------------------------------------------------------|
-| `verify_lakehouse.py`     | stack up: MinIO/Postgres/HMS/Trino reachable, catalogs configured   |
+| `verify_lakehouse.py`     | stack up: Garage/Postgres/HMS/Trino reachable, catalogs configured  |
 | `verify_bronze.py`        | 8 tables in `iceberg.bronze`, row counts = generator manifest, S3 objects present |
 | `verify_silver.py`        | 9 conformed tables, row conformance (bronze − documented drops), key integrity |
 | `verify_gold.py`          | 4 marts, 1:1 customer coverage, RFM/churn domains, **five-view revenue invariant** |
@@ -288,7 +290,7 @@ streaming.
 `make run` replays the seeded history of all 4 topics (verified
 bit-identical by `scripts/verify_kafka.py`), submits the 4 Flink jobs that
 append the topics into `iceberg.bronze.stream_*` (Iceberg v2, Hive catalog,
-S3A/MinIO; verified by `scripts/verify_stream.py`), and the silver layer
+S3A/Garage; verified by `scripts/verify_stream.py`), and the silver layer
 merges both sources into `fct_web_events` / `fct_orders` /
 `fct_order_items` / `fct_payments` with PK dedup (replay is a zero-delta
 no-op; live rows extend the facts and the gold marts). The dashboard has a

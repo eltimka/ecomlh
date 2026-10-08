@@ -21,7 +21,7 @@ Create a complete, interview-ready portfolio project that demonstrates:
 
 - 100% local and open-source
 - No real AWS / GCP / Snowflake / managed services
-- Use MinIO as S3-compatible storage
+- Use S3-compatible object storage (Garage, single-node)
 - Prefer Apache Iceberg tables (ACID, schema evolution, time travel)
 - Build **component by component** and verify each one before moving forward
 - Keep the project clean, well-documented, and easy to explain
@@ -33,7 +33,7 @@ Synthetic E-commerce data
         ↓
 Dagster Assets (Python + Polars / PyArrow)
         ↓
-Write Iceberg tables → MinIO (s3a://)
+Write Iceberg tables → Garage (S3, s3a://)
         ↓
 Hive Metastore (metadata)
         ↓
@@ -62,7 +62,7 @@ silver.fct_{web_events, orders, order_items, payments} merges
 
 | Layer              | Tool                          | Notes                                      |
 |--------------------|-------------------------------|--------------------------------------------|
-| Object Storage     | MinIO                         | S3-compatible, local                       |
+| Object Storage     | Garage (dxflrs/garage:v2.4.1) | S3-compatible, local, single-node          |
 | Metastore          | Apache Hive Metastore         | Postgres backend                           |
 | Table Format       | Apache Iceberg                | Via Hive catalog in Trino                  |
 | Query Engine       | Trino                         | Single coordinator for local use           |
@@ -86,7 +86,7 @@ ecommerce-customer-360-lakehouse/
 │   │       └── iceberg.properties
 │   ├── hive/
 │   │   └── conf/
-│   └── minio/                  # optional init scripts
+│   └── garage/garage.toml      # single-node config (S3 :3900, admin :3903)
 ├── dagster_project/
 │   ├── ecommerce_lakehouse/
 │   │   ├── __init__.py
@@ -112,7 +112,7 @@ ecommerce-customer-360-lakehouse/
  ├── flink/                          # Phase 12
  │   ├── Dockerfile                  # flink + iceberg-flink + hive/hadoop clients + S3A
  │   ├── pom.xml                     # maven dependency closure for the image
-  │   ├── hadoop/core-site.xml        # S3A/MinIO config (mounted, HADOOP_CONF_DIR)
+  │   ├── hadoop/core-site.xml        # S3A/Garage config (mounted, HADOOP_CONF_DIR)
   │   └── sql/                        # Flink SQL: 4 Kafka → Iceberg jobs
   │       ├── stream_web_events.sql
   │       ├── stream_orders.sql
@@ -122,7 +122,7 @@ ecommerce-customer-360-lakehouse/
 │   ├── app.py               # Streamlit dashboard (KPIs + 6 charts + profiles)
 │   └── marts.py             # the 11 gold-layer mart queries (single source of truth)
 ├── scripts/
-│   ├── bootstrap_minio.py
+│   ├── bootstrap_storage.py
 │   └── create_schemas.sql
 ├── .env.example
 ├── requirements.txt
@@ -131,6 +131,15 @@ ecommerce-customer-360-lakehouse/
 ```
 
 ## Build Order (Component by Component)
+
+> **Storage swap (2026-10-08):** the official `minio/minio` image was removed
+> from Docker Hub (2026-09-11). Object storage is now **Garage**
+> (`dxflrs/garage:v2.4.1`, single-node mode, S3 API :3900 / admin API :3903,
+> config in `docker/garage/garage.toml`). Everything else in the phase notes
+> below stays true as written; references to MinIO there describe the stack
+> as it was at the time. Cold-start fix: `scripts/bootstrap_storage.py` now
+> also creates the `iceberg.{bronze,silver,gold}` schemas (previously created
+> only by a verify script, after Flink had already failed on a fresh stack).
 
 Follow this exact sequence. **Do not skip ahead.** After each phase, verify that everything works before continuing.
 

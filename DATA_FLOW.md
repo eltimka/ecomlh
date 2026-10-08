@@ -26,7 +26,7 @@ flowchart TB
 
     DAG["Dagster — lakehouse_refresh job<br/>full-refresh CTAS per table + 109 asset checks<br/>(per layer + 3 layer gates; blocking checks stop downstream)"]
 
-    subgraph STORE["3 · Iceberg on MinIO (Hive Metastore, explicit s3a:// locations)"]
+    subgraph STORE["3 · Iceberg on Garage (Hive Metastore, explicit s3a:// locations)"]
         BRONZE["bronze.* — 8 batch tables<br/>raw landing: s3a://bronze/raw/<t>/"]
         SWEB["bronze.stream_* — 4 tables written by FLINK<br/>stream_web_events · stream_orders · stream_order_items · stream_payments<br/>(Dagster virtual assets observe them)"]
         SILVER["silver.* — 9 tables (3 dims + 6 facts)<br/>fct_web_events / fct_orders / fct_order_items / fct_payments<br/>= batch ∪ stream, dedup on PK (replay = zero delta)"]
@@ -55,7 +55,7 @@ flowchart TB
     GOLD --> SQL
 ```
 
-Storage (MinIO buckets): `bronze/` `silver/` `gold/` `flink-state/`
+Storage (Garage buckets): `bronze/` `silver/` `gold/` `flink-state/`
 (`raw/<t>/` + `<t>/` subdirs per table; Flink checkpoints).
 Metadata: Hive Metastore (Postgres backend) — catalogs: `iceberg` + `hive`.
 Queries: Trino :8080 (catalogs `iceberg`, `hive`).
@@ -75,7 +75,7 @@ invariant: **$15,221,141.27**.
 |---|------|--------------|
 | 1 | `step_up` | `docker compose up -d` the stack; wait until healthy |
 | 2 | `step_data` | run `generate_synthetic.py` (skips if `manifest.json` is fresh) |
-| 3 | `step_bootstrap` | `bootstrap_minio.py` — buckets + Trino schemas |
+| 3 | `step_bootstrap` | `bootstrap_storage.py` — buckets + Trino schemas |
 | 4 | `step_stream` | replay the batch history of **all 4 topics** into Kafka (`stream_producer.py --mode replay --if-empty`, per-topic idempotency) |
 | 5 | `step_flink` | submit the 4 Flink SQL jobs if not already running |
 | 6 | `step_stream_catchup` | poll until all 4 Flink jobs have committed their topics to Iceberg |
@@ -83,7 +83,7 @@ invariant: **$15,221,141.27**.
 | 8 | `step_refresh` | `dagster job execute -j lakehouse_refresh` (bronze→silver→gold + 109 checks) |
 | 9 | `step_verify` | the 7-script quick verification suite |
 
-The Docker stack (`docker/docker-compose.yml`): `minio`, `postgres`
+The Docker stack (`docker/docker-compose.yml`): `garage`, `postgres`
 (Hive Metastore backend), `hive` (metastore, thrift :9083), `trino`,
 `kafka` (KRaft single node), `kafka-init` (creates the 4 topics —
 `raw.web_events`, `raw.orders`, `raw.order_items`, `raw.payments` — each 3
@@ -121,11 +121,16 @@ TM = 8 slots / 11 GB so 4 jobs × (source + sink) fit).
 
 ## Stage 2 — Bootstrap (idempotent storage/layout)
 
-**Component:** `scripts/bootstrap_minio.py` (`make bootstrap`).
+**Component:** `scripts/bootstrap_storage.py` (`make bootstrap`).
 
-- Creates MinIO buckets: `bronze`, `silver`, `gold`, `flink-state`.
-- Creates the Trino/Hive schemas: `bronze`, `silver`, `gold` (iceberg
-  catalog) and `bronze_raw` (hive catalog) via `scripts/create_schemas.sql`.
+- Creates the Garage buckets: `bronze`, `silver`, `gold`, `flink-state`
+  (bronze is pre-created by the garage service via `--default-bucket`).
+- Creates the medallion schemas `iceberg.bronze` / `iceberg.silver` /
+  `iceberg.gold` via Trino (idempotent `CREATE SCHEMA IF NOT EXISTS`).
+  This is what makes cold starts work: the Flink jobs run
+  `CREATE TABLE IF NOT EXISTS iceberg.bronze.stream_*` and fail with
+  `InvalidObjectException` when the database does not exist in the Hive
+  Metastore yet. (`hive.bronze_raw` is created by the bronze assets.)
 - Every Iceberg table gets an **explicit S3 location**
   (`s3a://<bucket>/<table>`) — Trino's native filesystem cannot reach the
   HMS warehouse (`file://`) fallback, so locations are always stated.
@@ -139,7 +144,7 @@ the `lakehouse_refresh` job. Each asset does three things
 (`assets/bronze/__init__.py::_ingest_table`):
 
 1. **Land raw:** upload `data/synthetic/<table>.parquet` to the immutable
-   landing zone `s3a://bronze/raw/<table>/<table>.parquet` (MinIO).
+   landing zone `s3a://bronze/raw/<table>/<table>.parquet` (Garage).
    Re-runs overwrite the same object — byte-stable because the generator is
    deterministic.
 2. **Register:** (re)create a Trino **Hive external table**
@@ -400,8 +405,8 @@ op.
 
 ### Direct querying
 
-Trino :8080 (user `admin`, catalog `iceberg`); MinIO console :9001;
-Flink UI :8081.
+Trino :8080 (user `admin`, catalog `iceberg`); Garage admin API :3903
+(token in `docker/garage/garage.toml`); Flink UI :8081.
 
 ---
 
@@ -436,7 +441,7 @@ range on the next refresh.
 
 Per Iceberg table: `ALTER TABLE ... EXECUTE expire_snapshots`
 (older than 1h; skipped below 3 snapshots) + `remove_orphan_files` (older
-than 2h), with a MinIO size report before/after. Needed because the stream
+than 2h), with a Garage size report before/after. Needed because the stream
 table gains a snapshot on **every Flink checkpoint** (10s interval) even
 while idle; the retention margins stay far above the checkpoint interval so
 in-flight files are never touched. Tunables: `MAINTAIN_SNAPSHOT_AGE`,

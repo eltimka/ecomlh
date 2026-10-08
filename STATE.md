@@ -1,90 +1,134 @@
 # Project state — handoff snapshot
 
-_Captured 2026-08-22. Update or delete this file when the session it describes is stale._
+_Captured 2026-10-08, after a full fresh-cold-start validation of every
+component with **Garage** as the S3-compatible object store (MinIO removed)._
 
 ## Where things stand
 
-Everything is built and verified green (Phases 0–15 complete, all of
-PROJECT.md done). Last full run before shutdown:
+Everything rebuilt and re-validated from a truly clean slate (all
+volumes/data wiped, then `make up` → bootstrap → seed → replay →
+flink-up → refresh → verify, plus the ops demos). All gates green:
 
-- `lakehouse_refresh` Dagster job: 28 assets + **109/109 asset checks PASS**
-- `make verify`: **7/7 scripts `RESULT: PASS`** (lakehouse, kafka, stream,
-  bronze, silver, gold, dashboard)
-- Seed-42 invariants hold: 5,000 customers / 50,000 orders / GMV
-  $15,221,141.27 (five-view revenue invariant)
-- 4 Flink stream jobs ran clean, stream tables bit-identical to batch
+- `lakehouse_refresh` Dagster job: **109/109 asset checks PASS**
+- `verify_lakehouse / kafka / stream / bronze / silver / gold / dashboard`
+  — all **`RESULT: PASS`**
+- Cold-start path proven: a fresh `make run` no longer dies with
+  `InvalidObjectException(database hive.bronze)` (see "session fixes" —
+  medallion schemas are now created by bootstrap)
+- `make reseed SEED=123` validated end-to-end (Kafka topic reset,
+  `reset_stream.py`'s S3 client against Garage, Flink down/up, full
+  re-materialization: GMV $18,101,425.63 ≠ canonical, as expected),
+  then `make reseed SEED=42` restored the canonical dataset:
+  5,000 customers / 50,000 orders / GMV **$15,221,141.27**
+- `make down`'s dashboard kill verified: process-group kill actually
+  stops Streamlit (the stale-pid bug from the previous snapshot is fixed)
 
 ## Current system state (as left)
 
-- **All services stopped** — 0 containers, no dashboard, no producer.
-- **Docker volumes kept** (`minio-data`, `postgres-data`, `hive-auxjars`,
-  `kafka-data`): Iceberg tables, HMS schema, Kafka topics + committed
-  Flink consumer-group offsets all persist. A full wipe would be
-  `make clean` (was NOT run).
-- **Transient files removed**: `.logs/*`, all `__pycache__` dirs, and
-  `data/synthetic/` (regenerated deterministically from seed 42 on next run).
-- Working tree clean, matches HEAD.
+- **Stack running**: 7 containers up (garage, kafka, postgres,
+  hive-metastore, trino, flink-jobmanager, flink-taskmanager),
+  all healthy; dashboard up on :8501 (pid file `.logs/dashboard.pid`).
+- **Canonical seed-42 data loaded**: all 4 Flink stream jobs running,
+  bronze/silver/gold re-materialized, verify suite green.
+- Data lives in the `garage-data` volume (`/data` in the container);
+  a full wipe is `docker compose down -v` + `rm -rf data/synthetic .logs`
+  + Trino schema drop — i.e. start over from `make up && make bootstrap`.
+- Working tree **dirty**: the MinIO→Garage swap + fixes below are not
+  committed yet (see Git).
 
 ## Git
 
-- Branch `main`, **no remote**, 18 commits, HEAD = `4f8cd9a`.
-- All commits rewritten to author+committer
-  **Elvira Sumarokoff `<eltimka@gmail.com>`** (hashes changed in that
-  rewrite; pre-rewrite hashes are not recoverable — reflog was expired).
-- History: Phase 0 → Phase 15, one commit per phase, plus two fix commits
-  (`67dc78e` stale doc counts, `4f8cd9a` Flink job-state + checkpoint-check
-  fixes from this session).
+- Branch `main`, **no remote**, 19 commits, HEAD = `ec3c8c2`.
+- Uncommitted working tree (~22 modified, 3 new, 2 removed):
+  - removed: `scripts/bootstrap_minio.py`, `.../resources/minio.py`
+  - new: `scripts/bootstrap_storage.py`, `.../resources/s3.py`,
+    `docker/garage/garage.toml`
+- **Proposed commit split** (not yet made):
+  1. Garage swap + cold-start schema fix + `fs.s3a.endpoint.region` fix
+     (compose, configs, dagster resources/assets, scripts, Makefile, .env)
+  2. Docs/STATE refresh (README, DATA_FLOW, PROJECT.md, STATE.md)
 
 ## Resuming
 
 ```bash
-make run        # ~7 min: compose up, regenerate data/synthetic (seed 42),
-                # bootstrap, Kafka replay skipped (topics already seeded),
-                # resubmit 4 Flink jobs (resume from committed offsets -
-                # no re-appends), dashboard, full refresh + verify suite
-make verify     # quick re-check without re-materializing
-make verify-dq  # heavy DQ suite (2nd full refresh + check unit tests)
-make dev        # Dagster UI on :3000
-make stream-up  # live producer for the demo (stream-down to stop)
+# stack is already up; if it was stopped:
+make up          # compose up (7 services, garage healthgated)
+make bootstrap   # idempotent: Garage buckets + Trino medallion schemas
+make run         # full pipeline: seed 42, replay, flink-up, refresh, verify
+make verify      # quick re-check without re-materializing
+make reseed SEED=<n>   # full reset+replay+re-materialize (42 = canonical)
+make stream-up   # live producer demo (stream-down to stop)
+make down        # stop everything, incl. dashboard process group
 ```
 
-## Recent changes in this session (committed as `4f8cd9a`)
+## Session fixes (uncommitted)
 
-1. `scripts/start_all.py` `flink_job_states()`:
-   - **KeyError crash on cold start** (fresh Flink cluster, empty job list)
-     — the original reason `make run` died at step 5.
-   - **Stale-job masking**: after a cancel + resubmit the job overview lists
-     two entries with the same name; a stale `CANCELED` entry could mask the
-     `RUNNING` one, which would make `make run` resubmit and
-     **double-write the stream table**. Only active instances count now.
-2. `scripts/verify_stream.py` checkpoint check: was lifetime
-   `failed == 0`, permanently tripped by Flink's benign startup race
-   (first checkpoint trigger aborted while a task is still starting:
-   "Not all required tasks are currently running"). Now asserts every
-   checkpoint **after the first COMPLETED one** is clean; pre-commit
-   failures are tolerated, post-commit failures still hard-fail.
-   Unit-tested against synthetic histories incl. the exact incident.
+1. **MinIO → Garage** (`dxflrs/garage:v2.4.1`, pinned):
+   - Single-node mode via `docker/garage/garage.toml`
+     (`s3_region = "garage"`) + `server --single-node --default-bucket`;
+     cluster + access key auto-configured from `GARAGE_DEFAULT_*` env.
+   - Ports **3900 (S3) / 3903 (admin)** replace 9000/9001.
+   - Trino catalogs: native S3 (SDK v2) → `s3.endpoint=http://garage:3900`,
+     `s3.region=garage`, path-style.
+   - Hadoop S3A (Hive Metastore + Flink): endpoint/credentials updated in
+     both `core-site.xml` files.
+   - `bootstrap_minio.py` → `bootstrap_storage.py`; `resources/minio.py`
+     → `resources/s3.py`; resource key `minio` → `s3`.
+   - `reset_stream.py` keeps the `minio` **python package** as its S3
+     client (generic S3 SDK; validated against Garage by the reseed).
+2. **Cold-start crash**: medallion schemas (`iceberg.bronze/silver/gold`)
+   were only created by `verify_lakehouse.py`, which runs *after* Flink
+   job submission → `InvalidObjectException(database hive.bronze)`.
+   `bootstrap_storage.py` now creates the three schemas via Trino after
+   bucket creation, so `make run` works on a truly fresh stack.
+3. **Garage SigV4 region scope** (the non-obvious one): Garage validates
+   the region in the S3 `credential scope` against its `s3_region` and
+   rejects mismatches with `400 ... unexpected scope '.../us-east-1/s3',
+   expected '.../garage/s3'` — MinIO did not. Hadoop S3A signs
+   `us-east-1` by default; the failing caller was **hive-metastore**
+   validating table locations at `CREATE TABLE`. Fix:
+   `fs.s3a.endpoint.region=garage` in both `core-site.xml` files
+   (property exists in hadoop-aws 3.3.6, which the Hive 4.0.1 image
+   bundles). Trino's native S3 connector already signed with `garage`
+   via `s3.region` and never hit this.
+4. **Stale dashboard pid on `make down`** (carried over from the
+   2026-08-22 snapshot): `stop_dashboard()` now kills the **process
+   group** (`os.killpg`), and the Makefile `down` target uses
+   `kill -15 -$(cat .logs/dashboard.pid)` with a single-pid fallback.
+   Verified both paths actually terminate Streamlit.
+
+## Garage quirks (remember if storage changes again)
+
+- **SigV4 scope region must match `s3_region`** (fix #3 above). If you
+  ever switch `s3_region` to `us-east-1`, S3A needs no extra property;
+  Trino needs `s3.region=us-east-1`.
+- **Anonymous (unsigned) S3 requests hang indefinitely** (curl HEAD
+  hung 120 s). All stack clients sign, so it's harmless — but never
+  "test" Garage with an unsigned curl.
+- **Distroless image**: only the `/garage` binary, no shell/curl.
+  Healthcheck is `["CMD", "/garage", "status"]`; exec-based probing
+  won't work.
+- Fallback if S3A ever regresses: Iceberg `'io-impl'` → S3FileIO, or
+  set `s3_region = "us-east-1"` everywhere.
 
 ## Known issues / open items
 
-- **Stale dashboard pid**: `make down` reported "dashboard stopped" but a
-  Streamlit process survived (the pid in `.logs/dashboard.pid` did not match
-  the actual server pid — Streamlit respawns; the Popen pid goes stale).
-  `scripts/start_all.py` `step_dashboard()` already uses
-  `start_new_session=True`, so the fix is to kill the **process group**
-  (`os.killpg`) in `stop_dashboard()`/`make down` instead of one pid.
-  Not fixed yet — cosmetic (one `kill <pid>` resolves it), but it means
-  `make down` alone is not a reliable full stop.
-- The Flink startup checkpoint race itself (harmless trigger abort) can
-  still occur on fresh job submissions; `verify_stream.py` now tolerates it,
-  but the Flink UI will show `failed=1` on the job's lifetime counter.
-  Cosmetic; no data impact (offsets/snapshots only advance on completed
-  checkpoints).
+- The Flink startup checkpoint race (harmless first-trigger abort) can
+  still occur on fresh submissions; `verify_stream.py` tolerates it,
+  Flink UI may show lifetime `failed=1`. Cosmetic, no data impact.
+- Remaining `minio` string refs are intentional: the compose comment
+  documenting the swap, and the `minio` python-package import in
+  `reset_stream.py` (see fix #1).
 
 ## Environment notes
 
-- venv `.venv/` (Python 3.14) in place; `requirements.txt` satisfied.
-- All Docker images prebuilt locally (`ecommerce-flink:1.20.3` etc.) —
-  no image build needed on resume.
+- venv `.venv/` (Python 3.12.15 via uv); always call
+  `.venv/bin/python` / `.venv/bin/streamlit`.
+- All Docker images present locally, incl. built
+  `ecommerce-flink:1.20.3` — no image builds needed on resume.
 - Ports: 8501 dashboard, 3000 Dagster dev, 8080 Trino, 8081 Flink,
-  9000/9001 MinIO, 9092 Kafka, 9083 HMS, 5432 Postgres.
+  **3900 Garage S3 / 3903 admin**, 9092 Kafka, 9083 HMS, 5432 Postgres.
+- Compose-network container IPs: kafka .2, postgres .3, hive-metastore
+  .4, garage .5, flink-taskmanager .6, trino .7, flink-jobmanager .8.
+- After editing mounted JVM configs (`core-site.xml`, Trino catalog
+  properties), containers must be restarted — configs load at startup.
