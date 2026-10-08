@@ -379,7 +379,9 @@ recorded in "Streaming design decisions" below.
 ## Important Constraints
 
 - Never introduce real cloud services (AWS S3, Snowflake, etc.)
-- MinIO credentials should be simple for local use (e.g. `minioadmin` / `minioadmin`)
+- Object-storage credentials should stay simple for local use (Garage:
+  `garageadmin` + local-dev secret, set via `GARAGE_DEFAULT_*` in
+  `docker/docker-compose.yml` / `.env.example`)
 - Prefer Iceberg over plain Hive tables
 - Keep resource usage reasonable for a laptop (single Trino coordinator is fine)
 - All services must be startable with Docker Compose

@@ -103,10 +103,11 @@ and visualized in a local **Streamlit** dashboard.
 
 ```text
 Elvira_Project/
-├── docker/                    # compose stack + Trino/Hive configs
+├── docker/                    # compose stack + Trino/Hive/Garage configs
 │   ├── docker-compose.yml
 │   ├── trino/                 # config + hive/iceberg catalogs (native S3 FS)
-│   └── hive/                  # HMS config (Postgres backend)
+│   ├── hive/                  # HMS config (Postgres backend)
+│   └── garage/                # Garage single-node config (S3 :3900, admin :3903)
 ├── dagster_project/           # Dagster definitions
 │   └── ecommerce_lakehouse/
 │       ├── definitions.py     # assets, checks, 4 refresh jobs
@@ -124,7 +125,7 @@ Elvira_Project/
 
 ## Quick start
 
-**Prerequisites:** Docker + Compose, Python 3.11+ (3.14 tested), `make`.
+**Prerequisites:** Docker + Compose, Python 3.11+ (3.12 tested), `make`.
 
 ```bash
 # one-time
@@ -155,7 +156,7 @@ quick verification suite. Then:
 ```bash
 cd docker && docker compose up -d && cd ..
 .venv/bin/python data_generator/generate_synthetic.py   # if data/ missing
-.venv/bin/python scripts/bootstrap_minio.py              # buckets + schemas
+.venv/bin/python scripts/bootstrap_storage.py            # buckets + schemas
 .venv/bin/python data_generator/stream_producer.py --mode replay --if-empty
 make flink-up                                             # 4 Kafka → Iceberg stream jobs
 cd dagster_project
@@ -206,16 +207,19 @@ make reseed SEED=42      # restore the canonical dataset (bit-identical)
 
 ## Verification
 
-Each layer has a persistent verification script; all print `RESULT: PASS`:
-
 | Script                    | Proves                                                              |
 |---------------------------|---------------------------------------------------------------------|
-| `verify_lakehouse.py`     | stack up: Garage/Postgres/HMS/Trino reachable, catalogs configured  |
+| `verify_lakehouse.py`     | stack up: Garage reachable with all buckets, Trino reachable, medallion schemas exist, Iceberg test table create/write/query/drop round-trip |
+| `verify_kafka.py`         | all 4 topics: partition counts, message counts ≥ history, replay payloads bit-identical to the Parquet (content hashes), PKs unique |
+| `verify_stream.py`        | 4 Flink jobs RUNNING and caught up (committed ≥ topic end offset), stream tables duplicate-free, checkpoints clean |
 | `verify_bronze.py`        | 8 tables in `iceberg.bronze`, row counts = generator manifest, S3 objects present |
 | `verify_silver.py`        | 9 conformed tables, row conformance (bronze − documented drops), key integrity |
 | `verify_gold.py`          | 4 marts, 1:1 customer coverage, RFM/churn domains, **five-view revenue invariant** |
-| `verify_dq.py`            | check logic unit-tested, a failing check fails the run, full green refresh |
-| `verify_dashboard.py`     | all 11 marts execute on Trino, deterministic KPI invariants (5,000 / 50,000 / $15,221,141.27), app health → 200 |
+| `verify_dashboard.py`     | all 11 marts execute on Trino, seed-aware KPI invariants (manifest counts + cross-layer GMV), live-panel data sources, app health → 200 |
+
+The heavy DQ suite (`make verify-dq`) adds `verify_dq.py`: condition-evaluator
+unit tests, a live failure-path test, and a full green `lakehouse_refresh`
+re-run (28 assets, 109 checks).
 
 ## Key design decisions
 

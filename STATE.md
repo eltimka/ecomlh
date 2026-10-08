@@ -33,20 +33,18 @@ flink-up → refresh → verify, plus the ops demos). All gates green:
 - Data lives in the `garage-data` volume (`/data` in the container);
   a full wipe is `docker compose down -v` + `rm -rf data/synthetic .logs`
   + Trino schema drop — i.e. start over from `make up && make bootstrap`.
-- Working tree **dirty**: the MinIO→Garage swap + fixes below are not
-  committed yet (see Git).
+- Working tree **clean** (see Git).
 
 ## Git
 
-- Branch `main`, **no remote**, 19 commits, HEAD = `ec3c8c2`.
-- Uncommitted working tree (~22 modified, 3 new, 2 removed):
-  - removed: `scripts/bootstrap_minio.py`, `.../resources/minio.py`
-  - new: `scripts/bootstrap_storage.py`, `.../resources/s3.py`,
-    `docker/garage/garage.toml`
-- **Proposed commit split** (not yet made):
-  1. Garage swap + cold-start schema fix + `fs.s3a.endpoint.region` fix
-     (compose, configs, dagster resources/assets, scripts, Makefile, .env)
-  2. Docs/STATE refresh (README, DATA_FLOW, PROJECT.md, STATE.md)
+- Branch `main`, **no remote**, 21 commits, HEAD = `522883b`.
+- The MinIO→Garage swap landed as two commits on top of `ec3c8c2`:
+  1. `6ce31f8` — swap + cold-start schema fix + `fs.s3a.endpoint.region`
+     fix (compose, `docker/garage/garage.toml`, configs, dagster
+     resources/assets incl. `minio.py → s3.py` rename, scripts incl.
+     `bootstrap_minio.py → bootstrap_storage.py`, Makefile, .env)
+  2. `522883b` — docs/STATE refresh (README, DATA_FLOW, PROJECT.md,
+     STATE.md)
 
 ## Resuming
 

@@ -348,7 +348,7 @@ asset: cross-table checks attach to the gate so they run only after *all*
 tables of the layer committed (otherwise a check could read a sibling table
 inside its drop window).
 
-Check families (28 assets, 3 gates, 109 checks):
+Check families (28 assets = 25 tables + 3 layer gates, 109 checks):
 
 | Family | Condition | Example | Blocking? |
 |--------|-----------|---------|-----------|
@@ -398,7 +398,7 @@ Two views (sidebar toggle):
 ### Dagster UI (`make dev`, `:3000`)
 
 Asset graph with full lineage: 8 batch bronze ingests + 4 virtual stream
-assets → 9 silver → 4 gold (28 assets + 3 layer gates), each with its
+assets → 9 silver → 4 gold (28 assets = 25 tables + 3 layer gates), each with its
 checks; 4 jobs (`bronze_refresh`, `silver_refresh`, `gold_refresh`,
 `lakehouse_refresh`); per-run metadata (rows in/out, rule effects) on every
 op.
@@ -451,13 +451,13 @@ in-flight files are never touched. Tunables: `MAINTAIN_SNAPSHOT_AGE`,
 
 | Script | Proves |
 |--------|--------|
-| `verify_lakehouse.py` | all 11 marts execute; KPI invariants (5,000 customers, 50,000 orders, GMV $15,221,141.27, 12 months, 3 channels, 8 categories) |
-| `verify_kafka.py` | all 4 topics' content is the seeded history — bit-identical to batch (replay); live rows continue the id sequences |
-| `verify_stream.py` | all 4 Flink jobs caught up (committed ≥ topic end offset), each stream table duplicate-free |
-| `verify_bronze.py` | bronze row counts = manifest; bronze_raw landings present |
+| `verify_lakehouse.py` | stack up: Garage reachable with all buckets, Trino reachable, medallion schemas exist, Iceberg test table create/write/query/drop round-trip on `s3a://` |
+| `verify_kafka.py` | each topic: partition count, message count ≥ history, replay payloads bit-identical to the Parquet (per-row sha256 multiset vs `manifest.json`), PKs unique (live rows continue the id sequences) |
+| `verify_stream.py` | all 4 Flink jobs RUNNING and caught up (committed ≥ topic end offset), each stream table duplicate-free, checkpoints clean after the first completion (startup race tolerated) |
+| `verify_bronze.py` | bronze row counts = manifest; bronze_raw landings present on Garage |
 | `verify_silver.py` | merge invariants for all 4 merged facts (batch ⊆ merged ⊆ batch ∪ stream, live-aware bounds) |
 | `verify_gold.py` | five-view revenue invariant + mart shapes (live-aware month bounds) |
-| `verify_dashboard.py` | dashboard health + live-panel data sources (Flink REST ×4, Kafka offsets ×4, stream counts, latest orders) |
+| `verify_dashboard.py` | all 11 marts execute; seed-aware KPI invariants (manifest counts, cross-layer GMV, 12 months, 3 channels, 8 categories); live-panel data sources (Flink REST, Kafka end offsets, merge bounds, latest events); health → 200 |
 
 ---
 

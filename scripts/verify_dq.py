@@ -8,7 +8,7 @@ Checks:
   2. Live negative test: a deliberately failing check is recorded as
      failed (the suite is not vacuously green).
   3. Full ``lakehouse_refresh`` job run in a fresh instance:
-     all 25 assets (22 tables + 3 layer gates) materialize and all 91
+     all 28 assets (25 tables + 3 layer gates) materialize and all 109
      asset checks evaluate to
      passed.
 
