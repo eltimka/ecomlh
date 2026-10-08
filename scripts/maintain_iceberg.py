@@ -7,7 +7,7 @@ Two problems this solves:
     ~8,640 snapshots/day of metadata.
   * Every batch table is materialized by DROP TABLE + CTAS (full refresh).
     Trino's DROP removes the catalog metadata but leaves the old data files
-    in MinIO, where they accumulate silently across refreshes/reseeds.
+    in Garage, where they accumulate silently across refreshes/reseeds.
 
 What it does (per table in the iceberg catalog):
   1. ALTER TABLE ... EXECUTE expire_snapshots (metadata + unreferenced files)
@@ -50,13 +50,13 @@ load_dotenv(os.path.join(REPO_ROOT, ".env"))
 TRINO_HOST = os.environ.get("TRINO_HOST", "localhost")
 TRINO_PORT = int(os.environ.get("TRINO_PORT", "8080"))
 TRINO_USER = os.environ.get("TRINO_USER", "admin")
-MINIO_ENDPOINT = os.environ.get("MINIO_ENDPOINT", "localhost:9000")
-MINIO_ACCESS_KEY = os.environ.get("MINIO_ACCESS_KEY", "minioadmin")
-MINIO_SECRET_KEY = os.environ.get("MINIO_SECRET_KEY", "minioadmin")
-MINIO_BUCKETS = [
-    os.environ.get("MINIO_BUCKET_BRONZE", "bronze"),
-    os.environ.get("MINIO_BUCKET_SILVER", "silver"),
-    os.environ.get("MINIO_BUCKET_GOLD", "gold"),
+GARAGE_ENDPOINT = os.environ.get("GARAGE_ENDPOINT", "localhost:3900")
+GARAGE_ACCESS_KEY = os.environ.get("GARAGE_ACCESS_KEY", "garageadmin")
+GARAGE_SECRET_KEY = os.environ.get("GARAGE_SECRET_KEY", "garageadmin-local-dev-secret")
+GARAGE_BUCKETS = [
+    os.environ.get("GARAGE_BUCKET_BRONZE", "bronze"),
+    os.environ.get("GARAGE_BUCKET_SILVER", "silver"),
+    os.environ.get("GARAGE_BUCKET_GOLD", "gold"),
 ]
 
 SNAPSHOT_MAX_AGE = os.environ.get("MAINTAIN_SNAPSHOT_AGE", "1h")
@@ -83,9 +83,9 @@ def snapshot_count(cur, schema: str, table: str) -> int:
     return int(cur.fetchone()[0])
 
 
-def minio_size(s3) -> int:
+def garage_size(s3) -> int:
     total = 0
-    for bucket in MINIO_BUCKETS:
+    for bucket in GARAGE_BUCKETS:
         paginator = s3.get_paginator("list_objects_v2")
         for page in paginator.paginate(Bucket=bucket):
             total += sum(o.get("Size", 0) for o in page.get("Contents", []))
@@ -101,11 +101,11 @@ def main() -> int:
 
     s3 = boto3.client(
         "s3",
-        endpoint_url=f"http://{MINIO_ENDPOINT}",
-        aws_access_key_id=MINIO_ACCESS_KEY,
-        aws_secret_access_key=MINIO_SECRET_KEY,
+        endpoint_url=f"http://{GARAGE_ENDPOINT}",
+        aws_access_key_id=GARAGE_ACCESS_KEY,
+        aws_secret_access_key=GARAGE_SECRET_KEY,
     )
-    size_before = minio_size(s3)
+    size_before = garage_size(s3)
 
     con = trino.dbapi.connect(
         host=TRINO_HOST, port=TRINO_PORT, user=TRINO_USER, catalog="iceberg"
@@ -168,14 +168,14 @@ def main() -> int:
     finally:
         con.close()
 
-    size_after = minio_size(s3)
+    size_after = garage_size(s3)
     print("=" * 60)
     print(
         f"  snapshots: {snaps_before:,} -> {snaps_after:,} "
         f"({snaps_before - snaps_after:,} expired)"
     )
     print(f"  orphan files removed: {orphans_removed:,} ({orphans_bytes / 1e6:.1f} MB)")
-    print(f"  minio (bronze+silver+gold): {size_before / 1e6:.1f} MB -> {size_after / 1e6:.1f} MB")
+    print(f"  garage (bronze+silver+gold): {size_before / 1e6:.1f} MB -> {size_after / 1e6:.1f} MB")
     print("RESULT: PASS - iceberg maintenance complete")
     return 0
 

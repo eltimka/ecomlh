@@ -12,11 +12,11 @@
       1. hadoop-aws + aws-java-sdk-bundle on the HMS classpath
          (staged by the hive-aws-init one-shot service into /opt/hive/auxjars,
          added via HIVE_AUX_JARS_PATH in docker-compose.yml)
-      2. The fs.s3a.* properties below, pointing at MinIO.
+      2. The fs.s3a.* properties below, pointing at Garage.
     Without both, Iceberg table creation fails with:
       "ClassNotFoundException: Class org.apache.hadoop.fs.s3a.S3AFileSystem not found"
 
-    Local-dev credentials only - same as the MinIO service in ../docker-compose.yml.
+    Local-dev credentials only - same as the garage service in ../docker-compose.yml.
   -->
 
   <property>
@@ -25,19 +25,26 @@
   </property>
   <property>
     <name>fs.s3a.endpoint</name>
-    <value>http://minio:9000</value>
+    <value>http://garage:3900</value>
   </property>
   <property>
     <name>fs.s3a.access.key</name>
-    <value>minioadmin</value>
+    <value>garageadmin</value>
   </property>
   <property>
     <name>fs.s3a.secret.key</name>
-    <value>minioadmin</value>
+    <value>garageadmin-local-dev-secret</value>
   </property>
   <property>
     <name>fs.s3a.path.style.access</name>
     <value>true</value>
+  </property>
+  <!-- Garage validates the SigV4 credential scope against its s3_region.
+       S3A defaults to us-east-1, which Garage rejects (400 Bad Request);
+       this property overrides the signing region to match garage.toml. -->
+  <property>
+    <name>fs.s3a.endpoint.region</name>
+    <value>garage</value>
   </property>
   <property>
     <name>fs.s3a.connection.maximum</name>

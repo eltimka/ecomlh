@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Verify the Phase 5 bronze layer.
 
-Checks (Trino + MinIO must be up, bronze assets materialized):
+Checks (Trino + Garage must be up, bronze assets materialized):
   1. All 8 bronze Iceberg tables exist in iceberg.bronze.
   2. Row counts match the Phase 4 manifest (data/synthetic/manifest.json).
   3. Raw Parquet files exist in the bronze landing zone (s3a://bronze/raw/).
@@ -69,12 +69,12 @@ def main() -> int:
         check(f"rows match manifest: {table}", ok,
               f"{counts.get(table):,} vs expected {expected.get(table):,}" if table in expected else "not in manifest")
 
-    # 3. Raw landing zone files on MinIO
+    # 3. Raw landing zone files on Garage
     s3 = boto3.client(
         "s3",
-        endpoint_url=f"http://{os.environ.get('MINIO_ENDPOINT', 'localhost:9000')}",
-        aws_access_key_id="minioadmin",
-        aws_secret_access_key="minioadmin",
+        endpoint_url=f"http://{os.environ.get('GARAGE_ENDPOINT', 'localhost:3900')}",
+        aws_access_key_id=os.environ.get("GARAGE_ACCESS_KEY", "garageadmin"),
+        aws_secret_access_key=os.environ.get("GARAGE_SECRET_KEY", "garageadmin-local-dev-secret"),
         config=BotoConfig(signature_version="s3v4"),
     )
     keys = {

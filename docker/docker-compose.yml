@@ -6,7 +6,7 @@
 #   Logs:    docker compose logs -f trino
 #   Stop:    docker compose down           (add -v to also remove data volumes)
 #
-#   MinIO console:   http://localhost:9001   (minioadmin / minioadmin)
+#   Garage admin API: http://localhost:3903  (token in docker/garage/garage.toml)
 #   Trino UI:        http://localhost:8080
 #
 #   The Streamlit Customer 360 dashboard (http://localhost:8501) runs in the
@@ -17,7 +17,7 @@
 #
 #   Startup order:
 #   postgres -> hive-jdbc-init -> hive-aws-init -> hive (metastore) -> trino
-#   minio starts independently (ready in ~2s).
+#   garage starts independently (ready in ~5s).
 #   kafka starts independently; kafka-init (one-shot) creates the topics.
 #   flink (jobmanager + taskmanager) starts after kafka + hive are healthy;
 #   the stream JOB itself is submitted separately (make flink-up / flink-down).
@@ -42,26 +42,43 @@ networks:
 
 services:
   # ---------------------------------------------------------------------------
-  # MinIO - S3-compatible object storage (Iceberg data lake)
+  # Garage - S3-compatible object storage (Iceberg data lake).
+  #
+  # Replaces MinIO (official image deleted from Docker Hub 2026-09-11;
+  # community edition is source-only now). Garage (Deuxfleurs) is actively
+  # maintained and S3-compatible for everything this stack needs - see the
+  # S3 compatibility status in its docs. Single-node mode (no replication);
+  # the `--default-bucket` flag imports the default access key below and
+  # pre-creates the bronze bucket; scripts/bootstrap_storage.py creates the
+  # remaining buckets via the S3 API.
+  #
+  #   S3 API:    http://localhost:3900   (garageadmin / local-dev secret)
+  #   Admin API: http://localhost:3903   (token in docker/garage/garage.toml)
+  #
+  # Distroless image (no shell): the health check runs `garage status`,
+  # which exits 0 only when the node + cluster layout are healthy.
   # ---------------------------------------------------------------------------
-  minio:
-    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
-    container_name: minio
-    command: server /data --console-address ":9001"
+  garage:
+    image: dxflrs/garage:v2.4.1
+    container_name: garage
+    command: ["/garage", "server", "--single-node", "--default-bucket"]
     environment:
-      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-minioadmin}
-      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-minioadmin}
+      GARAGE_DEFAULT_ACCESS_KEY: ${GARAGE_ACCESS_KEY:-garageadmin}
+      GARAGE_DEFAULT_SECRET_KEY: ${GARAGE_SECRET_KEY:-garageadmin-local-dev-secret}
+      GARAGE_DEFAULT_BUCKET: ${GARAGE_BUCKET_BRONZE:-bronze}
     ports:
-      - "9000:9000" # S3 API
-      - "9001:9001" # Web console
+      - "3900:3900" # S3 API
+      - "3903:3903" # Admin API
     volumes:
-      - minio-data:/data
+      - ./garage/garage.toml:/etc/garage.toml:ro
+      - garage-meta:/var/lib/garage/meta
+      - garage-data:/var/lib/garage/data
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:9000/minio/health/live"]
+      test: ["CMD", "/garage", "status"]
       interval: 10s
-      timeout: 5s
+      timeout: 10s
       retries: 12
-      start_period: 10s
+      start_period: 15s
     restart: unless-stopped
 
   # ---------------------------------------------------------------------------
@@ -176,7 +193,7 @@ services:
   # ---------------------------------------------------------------------------
   # Trino - SQL query engine over Iceberg + raw bronze (single node, local dev).
   # The hive catalog (trino/catalog/hive.properties) uses Trino's native S3
-  # filesystem (fs.s3.enabled) to read raw Parquet from MinIO - no Hadoop.
+  # filesystem (fs.s3.enabled) to read raw Parquet from Garage - no Hadoop.
   # ---------------------------------------------------------------------------
   trino:
     image: trinodb/trino:483
@@ -190,7 +207,7 @@ services:
       - ./trino/catalog/iceberg.properties:/etc/trino/catalog/iceberg.properties:ro
       - ./trino/catalog/hive.properties:/etc/trino/catalog/hive.properties:ro
     depends_on:
-      minio:
+      garage:
         condition: service_healthy
       hive:
         condition: service_healthy
@@ -264,7 +281,7 @@ services:
   # ---------------------------------------------------------------------------
   # Flink - stream processing (Phase 12): Kafka raw.web_events -> Iceberg
   # bronze.stream_web_events. Image built from flink/ (Flink 1.20.3 + Iceberg
-  # 1.9.1 runtime + Hadoop S3A for MinIO). Flink UI: http://localhost:8081.
+  # 1.9.1 runtime + Hadoop S3A for Garage). Flink UI: http://localhost:8081.
   # core-site.xml (fs.s3a.*) is mounted on BOTH containers - the Iceberg
   # writers run on the taskmanager. Job lifecycle: make flink-up / flink-down.
   # ---------------------------------------------------------------------------
@@ -276,13 +293,13 @@ services:
     command: jobmanager
     environment:
       # Puts /opt/flink/conf (with the mounted core-site.xml) on the classpath
-      # so Hadoop's Configuration() picks up the S3A/MinIO settings.
+      # so Hadoop's Configuration() picks up the S3A/Garage settings.
       HADOOP_CONF_DIR: /opt/flink/conf
       FLINK_PROPERTIES: |
         jobmanager.rpc.address: flink-jobmanager
         jobmanager.memory.process.size: 1600m
         # Durable checkpoints on S3 (Phase 15): the flink-state bucket is
-        # created by scripts/bootstrap_minio.py. S3A goes through the
+        # created by scripts/bootstrap_storage.py. S3A goes through the
         # flink-s3-fs-hadoop plugin + the mounted core-site.xml.
         state.checkpoints.dir: s3a://flink-state/checkpoints
         execution.checkpointing.interval: 10s
@@ -328,7 +345,8 @@ services:
     restart: unless-stopped
 
 volumes:
-  minio-data:
+  garage-meta:
+  garage-data:
   postgres-data:
   hive-auxjars:
   kafka-data:

@@ -17,7 +17,7 @@ from dagster import AssetSelection, Definitions, define_asset_job
 
 from .assets import bronze_assets, gold_assets, silver_assets
 from .assets.checks import asset_checks
-from .resources import MinioResource, TrinoResource
+from .resources import S3StorageResource, TrinoResource
 
 bronze_refresh = define_asset_job(
     "bronze_refresh",
@@ -46,6 +46,6 @@ definitions = Definitions(
     jobs=[bronze_refresh, silver_refresh, gold_refresh, lakehouse_refresh],
     resources={
         "trino": TrinoResource(),
-        "minio": MinioResource(),
+        "s3": S3StorageResource(),
     },
 )

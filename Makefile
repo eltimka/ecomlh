@@ -28,14 +28,14 @@ up:
 ##      (data volumes are kept)
 down:
 	docker compose -f docker/docker-compose.yml down
-	@if [ -f .logs/dashboard.pid ]; then kill `cat .logs/dashboard.pid` 2>/dev/null; rm -f .logs/dashboard.pid; echo "dashboard stopped"; fi
+	@if [ -f .logs/dashboard.pid ]; then kill -15 -$$(cat .logs/dashboard.pid) 2>/dev/null; kill $$(cat .logs/dashboard.pid) 2>/dev/null; rm -f .logs/dashboard.pid; echo "dashboard stopped"; fi
 	@if [ -f .logs/stream_producer.pid ]; then kill `cat .logs/stream_producer.pid` 2>/dev/null; rm -f .logs/stream_producer.pid; echo "stream producer stopped"; fi
 
-## bootstrap: MinIO buckets + Trino schemas (idempotent)
+## bootstrap: Garage buckets + Trino schemas (idempotent)
 bootstrap:
-	$(VENV)/python scripts/bootstrap_minio.py
+	$(VENV)/python scripts/bootstrap_storage.py
 
-## refresh: materialize bronze -> silver -> gold with all 92 DQ checks
+## refresh: materialize bronze -> silver -> gold with all 109 DQ checks
 refresh:
 	cd dagster_project && $(VENV)/dagster job execute -m ecommerce_lakehouse.definitions -j lakehouse_refresh
 

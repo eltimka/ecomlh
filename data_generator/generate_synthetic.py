@@ -3,7 +3,7 @@
 
 Generates a deterministic, seedable e-commerce dataset as Parquet files for
 the lakehouse pipeline. Downstream, Phase 5 bronze assets load these files
-into Iceberg tables on MinIO.
+into Iceberg tables on Garage.
 
 Entities
 --------

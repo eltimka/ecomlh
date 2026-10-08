@@ -1,0 +1,43 @@
+# =============================================================================
+# Garage (S3-compatible object storage) - single-node local-dev configuration.
+#
+#   Image:    dxflrs/garage:v2.4.1 (pinned; distroless, /garage binary only)
+#   Command:  server --single-node --default-bucket
+#             --single-node     auto-configures a one-node cluster (no layout
+#                               assign/apply steps, replication_factor = 1)
+#             --default-bucket  imports a default access key + creates one
+#                               bucket from the GARAGE_DEFAULT_* env vars
+#                               (see docker-compose.yml); the remaining
+#                               buckets are created by scripts/bootstrap_storage.py
+#
+#   Ports:    3900 S3 API, 3901 RPC (internal), 3902 s3_web (internal),
+#             3903 Admin API
+#
+#   Local-dev secrets only (same convention as the rest of this stack).
+#   Health check: `docker compose exec garage /garage status`
+# =============================================================================
+
+metadata_dir = "/var/lib/garage/meta"
+data_dir = "/var/lib/garage/data"
+db_engine = "sqlite"
+
+replication_factor = 1
+
+rpc_bind_addr = "[::]:3901"
+rpc_public_addr = "127.0.0.1:3901"
+rpc_secret = "cf258702a678e4483af49867a45dd02cdbe9d7b9ba97b1e3bca6b67fccabbecb"
+
+[s3_api]
+s3_region = "garage"
+api_bind_addr = "[::]:3900"
+root_domain = ".s3.garage.localhost"
+
+[s3_web]
+bind_addr = "[::]:3902"
+root_domain = ".web.garage.localhost"
+index = "index.html"
+
+[admin]
+api_bind_addr = "[::]:3903"
+admin_token = "yF9QGkYpvcBVGHYIGpcQSFYzznAj+cTCPZqBJaYBWQo="
+metrics_token = "1yVjtNdR24enVSnvJsuk5sFrWxOXS5G3gE7P5GZcVSw="

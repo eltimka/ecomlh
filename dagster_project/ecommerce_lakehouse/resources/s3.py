@@ -1,4 +1,4 @@
-"""MinIO (S3-compatible) resource: object-storage access to the lakehouse."""
+"""Garage (S3-compatible) resource: object-storage access to the lakehouse."""
 
 from __future__ import annotations
 
@@ -15,29 +15,31 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 load_dotenv(REPO_ROOT / ".env")
 
 
-class MinioResource(ConfigurableResource):
-    """Dagster resource for the local MinIO S3 API.
+class S3StorageResource(ConfigurableResource):
+    """Dagster resource for the local Garage S3 API.
 
     Used for bucket management and object-level checks. Iceberg table
     *reads/writes* go through Trino (see TrinoResource) or pyiceberg in
     later phases; this resource is for infrastructure-level operations.
 
-    Defaults come from the repo-root .env (MINIO_* variables).
+    Defaults come from the repo-root .env (GARAGE_* variables).
     """
 
-    endpoint: str = os.environ.get("MINIO_ENDPOINT", "localhost:9000")
-    access_key: str = os.environ.get("MINIO_ACCESS_KEY", "minioadmin")
-    secret_key: str = os.environ.get("MINIO_SECRET_KEY", "minioadmin")
-    use_ssl: bool = os.environ.get("MINIO_USE_SSL", "false").lower() == "true"
-    region: str = os.environ.get("MINIO_REGION", "us-east-1")
+    endpoint: str = os.environ.get("GARAGE_ENDPOINT", "localhost:3900")
+    access_key: str = os.environ.get("GARAGE_ACCESS_KEY", "garageadmin")
+    secret_key: str = os.environ.get(
+        "GARAGE_SECRET_KEY", "garageadmin-local-dev-secret"
+    )
+    use_ssl: bool = os.environ.get("GARAGE_USE_SSL", "false").lower() == "true"
+    region: str = os.environ.get("GARAGE_REGION", "garage")
 
-    # Medallion buckets (see scripts/bootstrap_minio.py)
-    bucket_bronze: str = os.environ.get("MINIO_BUCKET_BRONZE", "bronze")
-    bucket_silver: str = os.environ.get("MINIO_BUCKET_SILVER", "silver")
-    bucket_gold: str = os.environ.get("MINIO_BUCKET_GOLD", "gold")
+    # Medallion buckets (see scripts/bootstrap_storage.py)
+    bucket_bronze: str = os.environ.get("GARAGE_BUCKET_BRONZE", "bronze")
+    bucket_silver: str = os.environ.get("GARAGE_BUCKET_SILVER", "silver")
+    bucket_gold: str = os.environ.get("GARAGE_BUCKET_GOLD", "gold")
 
     def s3_client(self) -> "boto3.client":
-        """Build an S3 client pointed at the local MinIO endpoint."""
+        """Build an S3 client pointed at the local Garage endpoint."""
         scheme = "https" if self.use_ssl else "http"
         return boto3.client(
             "s3",
@@ -49,7 +51,7 @@ class MinioResource(ConfigurableResource):
         )
 
     def list_buckets(self) -> list[str]:
-        """Return the names of all buckets in the MinIO instance."""
+        """Return the names of all buckets in the Garage instance."""
         return [b["Name"] for b in self.s3_client().list_buckets()["Buckets"]]
 
     def bucket_exists(self, name: str) -> bool:

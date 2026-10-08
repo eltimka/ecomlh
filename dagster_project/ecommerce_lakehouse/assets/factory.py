@@ -59,7 +59,7 @@ def build_layer_assets(
     """Build all assets of one medallion layer.
 
     ``layer`` doubles as the Trino schema (``iceberg.<layer>``) and the
-    MinIO bucket for table locations (``s3a://<layer>/<name>``).
+    S3 bucket for table locations (``s3a://<layer>/<name>``).
     ``external_deps`` maps asset names from upstream layers; ``local_deps``
     resolve against specs earlier in the list, so dimensions must precede
     the facts that join them.

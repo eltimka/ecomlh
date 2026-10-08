@@ -31,9 +31,9 @@ from stream_spec import STREAM_SPECS
 
 FLINK_REST = "http://localhost:8081"
 BUCKET = "bronze"
-MINIO_ENDPOINT = os.environ.get("MINIO_ENDPOINT", "localhost:9000")
-MINIO_USER = os.environ.get("MINIO_USER", "minioadmin")
-MINIO_PASSWORD = os.environ.get("MINIO_PASSWORD", "minioadmin")
+GARAGE_ENDPOINT = os.environ.get("GARAGE_ENDPOINT", "localhost:3900")
+GARAGE_ACCESS_KEY = os.environ.get("GARAGE_ACCESS_KEY", "garageadmin")
+GARAGE_SECRET_KEY = os.environ.get("GARAGE_SECRET_KEY", "garageadmin-local-dev-secret")
 
 
 def flink_rest(path: str) -> dict:
@@ -97,10 +97,10 @@ def step_purge_s3() -> None:
         from minio import Minio
 
         client = Minio(
-            MINIO_ENDPOINT,
-            access_key=MINIO_USER,
-            secret_key=MINIO_PASSWORD,
-            secure=MINIO_ENDPOINT.startswith("https"),
+            GARAGE_ENDPOINT,
+            access_key=GARAGE_ACCESS_KEY,
+            secret_key=GARAGE_SECRET_KEY,
+            secure=GARAGE_ENDPOINT.startswith("https"),
         )
         for spec in STREAM_SPECS:
             removed = 0

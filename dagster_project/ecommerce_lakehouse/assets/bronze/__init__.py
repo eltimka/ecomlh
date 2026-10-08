@@ -4,7 +4,7 @@ Each asset ingests one Phase-4 Parquet file (data/synthetic/<table>.parquet)
 into the lakehouse:
 
 1. Uploads the raw file to the immutable landing zone
-   ``s3a://bronze/raw/<table>/<table>.parquet`` (MinIO, via MinioResource).
+   ``s3a://bronze/raw/<table>/<table>.parquet`` (Garage, via S3StorageResource).
 2. Registers it as a Trino hive external table ``hive.bronze_raw.<table>``
    (Trino's native S3 filesystem, no Hadoop).
 3. Full-refresh loads it into Iceberg ``iceberg.bronze.<table>`` via CTAS.
@@ -23,7 +23,7 @@ import polars as pl
 from dagster import AssetExecutionContext
 
 from ..factory import GATE_NAME, build_layer_gate
-from ...resources.minio import MinioResource
+from ...resources.s3 import S3StorageResource
 from ...resources.trino import TrinoResource
 
 # assets/bronze/ -> assets/ -> ecommerce_lakehouse/ -> dagster_project/ -> repo root
@@ -73,11 +73,11 @@ def _sql_type(dtype: pl.DataType) -> str:
 def _ingest_table(
     context: AssetExecutionContext,
     table: str,
-    minio: MinioResource,
+    s3: S3StorageResource,
     trino: TrinoResource,
 ) -> None:
     """Run the bronze ingestion flow for one table; report metadata."""
-    bucket = minio.bucket_bronze
+    bucket = s3.bucket_bronze
 
     src = _source_dir() / f"{table}.parquet"
     if not src.exists():
@@ -88,7 +88,7 @@ def _ingest_table(
 
     # 1. Raw landing zone (immutable copy of the raw artifact)
     raw_key = f"raw/{table}/{table}.parquet"
-    raw_uri = minio.upload_file(src, raw_key, bucket=bucket)
+    raw_uri = s3.upload_file(src, raw_key, bucket=bucket)
 
     # 2. Hive external table over the raw directory (schema inferred from
     #    the actual parquet, so the DDL always matches the data)
@@ -138,9 +138,9 @@ def _bronze_asset(table: str):
         ),
     )
     def bronze_asset(
-        context: AssetExecutionContext, minio: MinioResource, trino: TrinoResource
+        context: AssetExecutionContext, s3: S3StorageResource, trino: TrinoResource
     ) -> None:
-        _ingest_table(context, table, minio, trino)
+        _ingest_table(context, table, s3, trino)
 
     return bronze_asset
 

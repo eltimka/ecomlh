@@ -1,13 +1,13 @@
 # =============================================================================
 # Flink 1.20.3 (Java 17) + Apache Iceberg 1.9.1 (Hive catalog) + Hadoop S3A
-# (MinIO). Phase 12: streams Kafka raw.web_events -> iceberg.bronze.
+# (Garage). Phase 12: streams Kafka raw.web_events -> iceberg.bronze.
 #
 #   Stage 1 (maven): resolves the exact dependency closure for
 #                    iceberg-flink-1.20 + flink-sql-connector-kafka (pom.xml).
 #   Stage 2 (flink): the Flink distribution with those jars in lib/ plus the
 #                    self-contained flink-s3-fs-hadoop shaded jar (hadoop-common
 #                    + hadoop-aws + AWS SDK v1) so Iceberg's HadoopFileIO can
-#                    write s3a:// to MinIO.
+#                    write s3a:// to Garage.
 #
 #   S3A configuration (fs.s3a.*) is NOT baked in - it is mounted at runtime
 #   from flink/hadoop/core-site.xml (so .env values stay authoritative).

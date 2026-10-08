@@ -6,7 +6,7 @@ Run: .venv/bin/python scripts/start_all.py   (or: make run)
 Steps (each idempotent - safe to re-run at any time):
   1. docker compose up -d + wait until the stack is healthy
   2. generate synthetic data if data/synthetic/ is missing
-  3. bootstrap MinIO buckets + Trino schemas
+  3. bootstrap Garage buckets + Trino schemas
   4. replay the batch history into Kafka - all 4 topics (web_events, orders,
      order_items, payments); per-topic, skipped when already seeded (keeps
      re-runs idempotent; `make reseed` resets it)
@@ -27,7 +27,7 @@ At the end you get:
   - Customer 360 dashboard: http://localhost:8501  (Streamlit)
   - Dagster UI:    http://localhost:3000  (start with `make dev`)
   - Trino:         localhost:8080 (user: admin, catalog: iceberg)
-  - MinIO console: http://localhost:9001 (minioadmin / minioadmin)
+  - Garage admin API: http://localhost:3903 (token in docker/garage/garage.toml)
 """
 
 from __future__ import annotations
@@ -49,7 +49,7 @@ DASHBOARD_PORT = int(os.environ.get("STREAMLIT_PORT", "8501"))
 
 # long-running services that must be (healthy); one-shot inits may be Exited (0)
 LONG_RUNNING = {
-    "minio", "lakehouse-postgres", "hive-metastore", "trino", "kafka",
+    "garage", "lakehouse-postgres", "hive-metastore", "trino", "kafka",
     "flink-jobmanager",
 }
 
@@ -126,11 +126,11 @@ def step_data() -> None:
 
 def step_bootstrap() -> None:
     print("=" * 62)
-    print("[3/8] bootstrap MinIO buckets + Trino schemas")
+    print("[3/8] bootstrap Garage buckets + Trino schemas")
     print("=" * 62)
-    proc = run([str(VENV / "python"), "scripts/bootstrap_minio.py"])
+    proc = run([str(VENV / "python"), "scripts/bootstrap_storage.py"])
     if proc.returncode != 0:
-        fail("minio bootstrap failed")
+        fail("storage bootstrap failed")
 
 
 def step_stream() -> None:
@@ -228,7 +228,15 @@ def stop_dashboard() -> None:
     if not pid_file.exists():
         return
     try:
-        os.kill(int(pid_file.read_text().strip()), 15)
+        pid = int(pid_file.read_text().strip())
+        try:
+            # The dashboard runs in its own session (start_new_session=True),
+            # so kill the whole process group - Streamlit spawns children
+            # that would otherwise keep the port.
+            os.killpg(os.getpgid(pid), 15)
+        except (ValueError, OSError):
+            # Stale pid or not a group leader: best-effort single-process kill.
+            os.kill(pid, 15)
     except (ValueError, OSError):
         pass
     pid_file.unlink(missing_ok=True)
@@ -321,7 +329,7 @@ def main() -> None:
     print(f"  Customer 360 dashboard : http://localhost:{DASHBOARD_PORT}  (Streamlit)")
     print("  Dagster UI             : .venv/bin/dagster dev  -> http://localhost:3000")
     print("  Trino                  : localhost:8080 (user: admin, catalog: iceberg)")
-    print("  MinIO console          : http://localhost:9001 (minioadmin / minioadmin)")
+    print("  Garage admin API       : http://localhost:3903 (token in docker/garage/garage.toml)")
     print("  Kafka                  : localhost:9092 (4 topics: raw.web_events/orders/order_items/payments)")
     print("  Flink                  : http://localhost:8081 (4 stream jobs -> iceberg.bronze.stream_*)")
     print(f"  Full DQ suite          : make verify-dq   (took {time.time() - t0:.0f}s total)")

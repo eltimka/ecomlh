@@ -169,7 +169,7 @@ with st.sidebar:
         "109 DQ checks).\n\n"
         "**Data**: synthetic, seeded (`DATA_SEED`). Re-seed with "
         "`make reseed SEED=<n>` to see the whole pipeline react to new data.\n\n"
-        "**Stack**: MinIO · Iceberg · Trino · Dagster · Streamlit."
+        "**Stack**: Garage · Iceberg · Trino · Dagster · Streamlit."
     )
 
 
@@ -328,7 +328,7 @@ if view == LIVE_VIEW:
 st.title("Customer 360")
 st.caption(
     "E-commerce customer analytics over the **gold layer** "
-    "(`iceberg.gold`, MinIO + Iceberg + Trino). Live queries - every filter "
+    "(`iceberg.gold`, Garage + Iceberg + Trino). Live queries - every filter "
     "change is executed on Trino."
 )
 

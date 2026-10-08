@@ -2,11 +2,11 @@
 """End-to-end Phase 2 verification: buckets, schemas, and a test Iceberg table.
 
 Checks, in order:
-  1. MinIO is reachable and the bronze/silver/gold buckets exist
+  1. Garage is reachable and the bronze/silver/gold buckets exist
   2. Trino is reachable (SELECT 1)
   3. Medallion schemas exist in the Iceberg catalog (creates them if missing)
   4. A test Iceberg table can be created, written, queried, and dropped
-     (location lives on MinIO: s3a://bronze/bootstrap_test)
+     (location lives on Garage: s3a://bronze/bootstrap_test)
 
 Usage:
     python scripts/verify_lakehouse.py
@@ -45,26 +45,26 @@ def check(name: str, ok: bool, detail: str = "") -> bool:
     return ok
 
 
-def minio_check() -> None:
-    endpoint = os.environ.get("MINIO_ENDPOINT", "localhost:9000")
-    use_ssl = os.environ.get("MINIO_USE_SSL", "false").lower() == "true"
+def garage_check() -> None:
+    endpoint = os.environ.get("GARAGE_ENDPOINT", "localhost:3900")
+    use_ssl = os.environ.get("GARAGE_USE_SSL", "false").lower() == "true"
     s3 = boto3.client(
         "s3",
         endpoint_url=f"{'https' if use_ssl else 'http'}://{endpoint}",
-        aws_access_key_id=os.environ.get("MINIO_ACCESS_KEY", "minioadmin"),
-        aws_secret_access_key=os.environ.get("MINIO_SECRET_KEY", "minioadmin"),
-        region_name=os.environ.get("MINIO_REGION", "us-east-1"),
+        aws_access_key_id=os.environ.get("GARAGE_ACCESS_KEY", "garageadmin"),
+        aws_secret_access_key=os.environ.get("GARAGE_SECRET_KEY", "garageadmin-local-dev-secret"),
+        region_name=os.environ.get("GARAGE_REGION", "garage"),
         config=Config(signature_version="s3v4"),
     )
     try:
         buckets = {b["Name"] for b in s3.list_buckets()["Buckets"]}
     except Exception as exc:  # noqa: BLE001 - any connectivity failure is a FAIL
-        check("MinIO reachable", False, str(exc))
+        check("Garage reachable", False, str(exc))
         return
 
-    check("MinIO reachable", True)
+    check("Garage reachable", True)
     for layer in ("bronze", "silver", "gold"):
-        name = os.environ.get(f"MINIO_BUCKET_{layer.upper()}", layer)
+        name = os.environ.get(f"GARAGE_BUCKET_{layer.upper()}", layer)
         check(f"bucket '{name}' exists", name in buckets)
 
 
@@ -183,7 +183,7 @@ def trino_checks() -> None:
 
 def main() -> int:
     print("Phase 2 verification: lakehouse bootstrap\n")
-    minio_check()
+    garage_check()
     print()
     trino_checks()
     print()
