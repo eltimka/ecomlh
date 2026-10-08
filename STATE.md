@@ -37,14 +37,20 @@ flink-up → refresh → verify, plus the ops demos). All gates green:
 
 ## Git
 
-- Branch `main`, **no remote**, 21 commits, HEAD = `522883b`.
-- The MinIO→Garage swap landed as two commits on top of `ec3c8c2`:
-  1. `6ce31f8` — swap + cold-start schema fix + `fs.s3a.endpoint.region`
+- Branch `main`, 22 commits, HEAD = `5a1a4af`. Remote `origin` =
+  `git@github.com:eltimka/ecomlh.git` — local is **3 commits ahead,
+  not yet pushed**. All commits authored as
+  `Elvira Sumarokoff <eltimka@gmail.com>` (global gitconfig set
+  2026-10-08; the 3 newest commits were author-rewritten to match).
+- The MinIO→Garage swap landed as three commits on top of `ec3c8c2`:
+  1. `5529cd2` — swap + cold-start schema fix + `fs.s3a.endpoint.region`
      fix (compose, `docker/garage/garage.toml`, configs, dagster
      resources/assets incl. `minio.py → s3.py` rename, scripts incl.
      `bootstrap_minio.py → bootstrap_storage.py`, Makefile, .env)
-  2. `522883b` — docs/STATE refresh (README, DATA_FLOW, PROJECT.md,
+  2. `8e643d2` — docs/STATE refresh (README, DATA_FLOW, PROJECT.md,
      STATE.md)
+  3. `5a1a4af` — docs audit pass (verify tables, counts, remaining
+     stale refs)
 
 ## Resuming
 
