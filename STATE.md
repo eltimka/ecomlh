@@ -1,7 +1,8 @@
 # Project state — handoff snapshot
 
 _Captured 2026-10-08, after a full fresh-cold-start validation of every
-component with **Garage** as the S3-compatible object store (MinIO removed)._
+component with **Garage** as the S3-compatible object store (MinIO removed);
+same day the stack was brought down with `make down` (data volumes kept)._
 
 ## Where things stand
 
@@ -25,37 +26,20 @@ flink-up → refresh → verify, plus the ops demos). All gates green:
 
 ## Current system state (as left)
 
-- **Stack running**: 7 containers up (garage, kafka, postgres,
-  hive-metastore, trino, flink-jobmanager, flink-taskmanager),
-  all healthy; dashboard up on :8501 (pid file `.logs/dashboard.pid`).
-- **Canonical seed-42 data loaded**: all 4 Flink stream jobs running,
-  bronze/silver/gold re-materialized, verify suite green.
+- **Stack down** (stopped with `make down`): containers and network
+  removed, all data volumes kept (garage-meta/-data, postgres-data,
+  kafka-data, hive-auxjars); dashboard and stream producer stopped
+  (no pid files in `.logs/`).
+- **Canonical seed-42 data loaded**: bronze/silver/gold re-materialized
+  and verify suite green as of the last run before shutdown.
 - Data lives in the `garage-data` volume (`/data` in the container);
   a full wipe is `docker compose down -v` + `rm -rf data/synthetic .logs`
   + Trino schema drop — i.e. start over from `make up && make bootstrap`.
-- Working tree **clean** (see Git).
-
-## Git
-
-- Branch `main`, 22 commits, HEAD = `5a1a4af`. Remote `origin` =
-  `git@github.com:eltimka/ecomlh.git` — local is **3 commits ahead,
-  not yet pushed**. All commits authored as
-  `Elvira Sumarokoff <eltimka@gmail.com>` (global gitconfig set
-  2026-10-08; the 3 newest commits were author-rewritten to match).
-- The MinIO→Garage swap landed as three commits on top of `ec3c8c2`:
-  1. `5529cd2` — swap + cold-start schema fix + `fs.s3a.endpoint.region`
-     fix (compose, `docker/garage/garage.toml`, configs, dagster
-     resources/assets incl. `minio.py → s3.py` rename, scripts incl.
-     `bootstrap_minio.py → bootstrap_storage.py`, Makefile, .env)
-  2. `8e643d2` — docs/STATE refresh (README, DATA_FLOW, PROJECT.md,
-     STATE.md)
-  3. `5a1a4af` — docs audit pass (verify tables, counts, remaining
-     stale refs)
 
 ## Resuming
 
 ```bash
-# stack is already up; if it was stopped:
+# stack is stopped (data volumes intact):
 make up          # compose up (7 services, garage healthgated)
 make bootstrap   # idempotent: Garage buckets + Trino medallion schemas
 make run         # full pipeline: seed 42, replay, flink-up, refresh, verify
